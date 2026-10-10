@@ -126,6 +126,7 @@
     "removeConfirmDescription": "This action cannot be undone."
   },
   "connected": "connected",
+  "coreVersion": "Core",
   "connecting options": "Connecting Options",
   "create account": "Create a new account",
   "dark mode": "Dark Mode",

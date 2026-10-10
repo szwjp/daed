@@ -303,6 +303,12 @@ export function HeaderWithActions() {
               </Code>
             </SimpleTooltip>
           )}
+
+          {!matchSmallScreen && generalQuery?.general.dae.version && (
+            <Code className="text-xs font-semibold px-2 py-1 rounded-md bg-secondary/80 hover:bg-secondary transition-colors">
+              {`${t('coreVersion')} ${generalQuery.general.dae.version}`}
+            </Code>
+          )}
         </div>
 
         <div className={cn('flex items-center', matchSmallScreen ? 'gap-1' : 'gap-2')}>

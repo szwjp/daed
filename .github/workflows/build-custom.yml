@@ -3,7 +3,7 @@ name: Build daed bundle (linux/amd64)
 # 用途：用官方 daed 源码 + bump 后的 wing 子模块，产出纯上游的 x86_64 daed 二进制。
 # 与官方 release-please.yml 的差异只有两点：
 #   1) 显式安装 clang/llvm（官方 workflow 依赖 runner 预装，ebpf 那步容易挂）
-#   2) 前端直接用官方 v2.1.1 的 web.zip（省掉 Node/pnpm/turbo 整条链）
+#   2) 前端从源码构建（含自定义 UI：Header 显示内核版本），不再用官方 web.zip
 
 on:
   workflow_dispatch:
@@ -54,13 +54,22 @@ jobs:
           clang --version | head -2
           llvm-strip --version | head -1
 
-      - name: Fetch prebuilt web assets (official v2.1.1 web.zip)
+      - uses: pnpm/action-setup@v6.0.9
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: latest
+          cache: pnpm
+
+      - name: Build web assets from source (includes the daemon-version chip)
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
         run: |
-          curl -sSL -o /tmp/web.zip "https://github.com/daeuniverse/daed/releases/download/v2.1.1/web.zip"
-          mkdir -p /tmp/webout dist
-          unzip -q /tmp/web.zip -d /tmp/webout
-          cp -r /tmp/webout/web/. dist/
-          du -sh dist && ls dist
+          pnpm install
+          pnpm build --filter daed
+          test -f apps/web/dist/index.html
+          du -sh apps/web/dist
+          grep -rlo "coreVersion" apps/web/dist/assets | head -3
 
       - name: make deps (graphql resolver + eBPF object)
         working-directory: wing
@@ -71,7 +80,7 @@ jobs:
         run: |
           mkdir -p ../bundled
           make OUTPUT=../bundled/daed-linux-x86_64 APPNAME=daed \
-               WEB_DIST=../dist VERSION="v2.1.1-wingmain-$(date -u +%Y%m%d)" bundle
+               WEB_DIST=../apps/web/dist VERSION="v2.1.1-wingmain-$(date -u +%Y%m%d)" bundle
 
       - name: Collect bundle
         run: |

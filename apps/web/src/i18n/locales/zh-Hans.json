@@ -126,6 +126,7 @@
     "removeConfirmDescription": "此操作不可撤销。"
   },
   "connected": "已连接",
+  "coreVersion": "内核",
   "connecting options": "连接选项",
   "create account": "创建一个新的账户",
   "dark mode": "暗黑模式",
