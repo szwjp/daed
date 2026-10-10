@@ -25,6 +25,13 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
+      - name: Pin dae-core to main (wing main requires Marshaller.Bytes, restored in #1117)
+        run: |
+          DAECORE=e3fee8fbc68a65167af13b685ab0b958757e20ee
+          git -C wing/dae-core fetch --depth 1 origin "$DAECORE"
+          git -C wing/dae-core checkout -q "$DAECORE"
+          git -C wing/dae-core submodule update --init --recursive
+
       - name: Show pinned revisions
         run: |
           echo "daed     : $(git rev-parse HEAD)"
