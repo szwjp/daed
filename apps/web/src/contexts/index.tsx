@@ -6,6 +6,7 @@ import { GraphQLClient } from 'graphql-request'
 import { createContext, use, useEffect, useMemo } from 'react'
 import { toast } from 'sonner'
 
+import { DEFAULT_ENDPOINT_URL } from '~/constants'
 import { isMockMode, MockGraphQLClient } from '~/mocks'
 import { endpointURLAtom, tokenAtom } from '~/store'
 
@@ -70,11 +71,11 @@ export function QueryProvider({ children, colorScheme, themeMode, setThemeMode }
       return new MockGraphQLClient('mock://localhost')
     }
 
-    return new GraphQLClient(endpointURL, {
+    const clientOptions = {
       headers: {
         authorization: `Bearer ${token}`,
       },
-      responseMiddleware: (response) => {
+      responseMiddleware: (response: unknown) => {
         const error = (response as ClientError).response?.errors?.[0]
 
         if (error) {
@@ -85,7 +86,30 @@ export function QueryProvider({ children, colorScheme, themeMode, setThemeMode }
           }
         }
       },
-    })
+    }
+
+    const client = new GraphQLClient(endpointURL, clientOptions)
+
+    // The endpoint is persisted in localStorage, so it survives address changes
+    // (e.g. a new WAN IP after a PPPoE reconnect). When the stored endpoint is
+    // unreachable, fall back to the endpoint derived from the address this page
+    // was loaded from and persist that, instead of leaving every query broken.
+    async function request(document: RequestDocument, variables?: Variables) {
+      try {
+        return await client.request(document, variables)
+      } catch (err) {
+        if ((err as ClientError).response || endpointURL === DEFAULT_ENDPOINT_URL) {
+          throw err
+        }
+        console.warn('[daed] endpoint unreachable; falling back to', DEFAULT_ENDPOINT_URL)
+        const fallback = new GraphQLClient(DEFAULT_ENDPOINT_URL, clientOptions)
+        const result = await fallback.request(document, variables)
+        endpointURLAtom.set(DEFAULT_ENDPOINT_URL)
+        return result
+      }
+    }
+
+    return { request: request as GQLClient['request'] }
   }, [endpointURL, token])
 
   const colorSchemeContextValue = useMemo(

@@ -1,7 +1,7 @@
 import { useStore } from '@nanostores/react'
 import request from 'graphql-request'
 import { Link2, LockKeyhole, User } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Trans, useTranslation } from 'react-i18next'
 import { Link } from 'react-router-dom'
 import { toast } from 'sonner'
@@ -53,6 +53,31 @@ export function SetupPage() {
 
   const [endpointFormData, setEndpointFormData] = useState({ endpointURL: defaultEndpointURL })
   const [endpointFormErrors, setEndpointFormErrors] = useState<{ endpointURL?: string }>({})
+
+  // A persisted endpoint can go stale (e.g. the router's WAN IP changed after a
+  // reconnect). Probe it on mount and quietly fall back to the address this page
+  // was loaded from, so the wizard does not strand the user on the endpoint step.
+  useEffect(() => {
+    if (defaultEndpointURL === DEFAULT_ENDPOINT_URL) {
+      return
+    }
+
+    let cancelled = false
+
+    getNumberUsers(defaultEndpointURL).catch(() => {
+      if (cancelled) {
+        return
+      }
+
+      console.warn('[daed] endpoint unreachable; falling back to', DEFAULT_ENDPOINT_URL)
+      endpointURLAtom.set(DEFAULT_ENDPOINT_URL)
+      setEndpointFormData({ endpointURL: DEFAULT_ENDPOINT_URL })
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [defaultEndpointURL])
 
   const [signupFormData, setSignupFormData] = useState({ username: '', password: '' })
   const [signupFormErrors, setSignupFormErrors] = useState<{ username?: string; password?: string }>({})
