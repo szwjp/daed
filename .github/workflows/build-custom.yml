@@ -1,0 +1,83 @@
+name: Build daed bundle (linux/amd64)
+
+# 用途：用官方 daed 源码 + bump 后的 wing 子模块，产出纯上游的 x86_64 daed 二进制。
+# 与官方 release-please.yml 的差异只有两点：
+#   1) 显式安装 clang/llvm（官方 workflow 依赖 runner 预装，ebpf 那步容易挂）
+#   2) 前端直接用官方 v2.1.1 的 web.zip（省掉 Node/pnpm/turbo 整条链）
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [bump-wing-main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GOOS: linux
+      GOARCH: amd64
+      GOAMD64: v1
+      CGO_ENABLED: "0"
+    steps:
+      - name: Checkout with submodules
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Show pinned revisions
+        run: |
+          echo "daed     : $(git rev-parse HEAD)"
+          echo "wing     : $(git -C wing rev-parse HEAD)"
+          echo "dae-core : $(git -C wing/dae-core rev-parse HEAD)"
+          echo "outbound : $(grep -E 'olicesx/outbound' wing/go.mod | head -1)"
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: false
+
+      - name: Install clang / llvm-strip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm
+          if ! command -v llvm-strip >/dev/null 2>&1; then
+            sudo ln -sf "$(ls /usr/bin/llvm-strip* | head -1)" /usr/local/bin/llvm-strip
+          fi
+          clang --version | head -2
+          llvm-strip --version | head -1
+
+      - name: Fetch prebuilt web assets (official v2.1.1 web.zip)
+        run: |
+          curl -sSL -o /tmp/web.zip "https://github.com/daeuniverse/daed/releases/download/v2.1.1/web.zip"
+          mkdir -p /tmp/webout dist
+          unzip -q /tmp/web.zip -d /tmp/webout
+          cp -r /tmp/webout/web/. dist/
+          du -sh dist && ls dist
+
+      - name: make deps (graphql resolver + eBPF object)
+        working-directory: wing
+        run: make deps
+
+      - name: Bundle
+        working-directory: wing
+        run: |
+          mkdir -p ../bundled
+          make OUTPUT=../bundled/daed-linux-x86_64 APPNAME=daed \
+               WEB_DIST=../dist VERSION="v2.1.1-wingmain-$(date -u +%Y%m%d)" bundle
+
+      - name: Collect bundle
+        run: |
+          cd bundled
+          cp ../install/daed.service ../install/daed.desktop .
+          cp -r ../install/icons .
+          curl -sSL -o geoip.dat  https://github.com/v2rayA/dist-v2ray-rules-dat/raw/master/geoip.dat
+          curl -sSL -o geosite.dat https://github.com/v2rayA/dist-v2ray-rules-dat/raw/master/geosite.dat
+          file daed-linux-x86_64
+          ./daed-linux-x86_64 --version || true
+          strings daed-linux-x86_64 | grep -cE "disable_thp|auto_sniff_punt|bpf_conn_state_map_size" || true
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: daed-linux-x86_64-bundle
+          path: bundled/*
