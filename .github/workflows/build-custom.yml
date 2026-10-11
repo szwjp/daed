@@ -1,14 +1,16 @@
 name: Build daed bundle (linux/amd64)
 
 # 用途：用官方 daed 源码 + bump 后的 wing 子模块，产出纯上游的 x86_64 daed 二进制。
-# 与官方 release-please.yml 的差异只有两点：
+# 官方 release-please.yml 已删除：fork 里的 Actions 无权创建 PR，该流程必然失败，
+# 且本仓库的产物走 Actions artifact 而非 release，故不走它。
+# 与官方构建相比的差异：
 #   1) 显式安装 clang/llvm（官方 workflow 依赖 runner 预装，ebpf 那步容易挂）
 #   2) 前端从源码构建（含自定义 UI：Header 显示内核版本），不再用官方 web.zip
 
 on:
   workflow_dispatch:
   push:
-    branches: [bump-wing-main]
+    branches: [main]
 
 jobs:
   build:
