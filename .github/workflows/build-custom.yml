@@ -26,11 +26,65 @@ jobs:
           fetch-depth: 0
 
       - name: Pin dae-core to main (wing main requires Marshaller.Bytes, restored in #1117)
+        id: pin
         run: |
           DAECORE=e3fee8fbc68a65167af13b685ab0b958757e20ee
           git -C wing/dae-core fetch --depth 1 origin "$DAECORE"
           git -C wing/dae-core checkout -q "$DAECORE"
           git -C wing/dae-core submodule update --init --recursive
+          echo "sha=$DAECORE" >> "$GITHUB_OUTPUT"
+
+      # 断言：pin 的 dae-core 是否仍等于 dae main 的 tip。
+      # 这道断言不校验编译产物，只校验「你构建的内核是不是上游最新」——
+      # 上一版流程里 pin 落后时 CI 依然全绿，产物能跑、版本号照常，
+      # 只有内核代码是旧的。这是唯一能在发布前发现 pin 腐烂的地方。
+      - name: Assert dae-core pin matches dae main
+        run: |
+          PINNED="${{ steps.pin.outputs.sha }}"
+          cd wing/dae-core
+
+          # 取 main 的 tip。浅克隆下用 FETCH_HEAD，避免 --depth 1 时
+          # main tip 与 pin 不在同一历史导致 fetch 失败。
+          git fetch --depth 1 origin main
+          UPSTREAM="$(git rev-parse FETCH_HEAD)"
+
+          echo "pinned    : $PINNED"
+          echo "dae main  : $UPSTREAM"
+
+          if [ "$PINNED" = "$UPSTREAM" ]; then
+            echo "::notice title=dae-core pin::in sync with dae main"
+            exit 0
+          fi
+
+          # 落后多少：需要完整历史才能算，超出浅克隆深度就退化为 "unknown"。
+          git fetch --unshallow origin 2>/dev/null || git fetch --depth 200 origin main
+          if git merge-base --is-ancestor "$PINNED" "$UPSTREAM" 2>/dev/null; then
+            BEHIND="$(git rev-list --count "$PINNED".."$UPSTREAM")"
+            SUBJECT="$(git log -1 --format=%s "$UPSTREAM")"
+            {
+              echo "## dae-core pin 已落后 dae main" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "- pinned: \`$PINNED\`" >> "$GITHUB_STEP_SUMMARY"
+              echo "- main  : \`$UPSTREAM\`" >> "$GITHUB_STEP_SUMMARY"
+              echo "- 落后  : **$BEHIND** 个 commit" >> "$GITHUB_STEP_SUMMARY"
+              echo "- main  : $SUBJECT" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "更新 pin：改 build-custom.yml 里 pin 步骤的 DAECORE，" >> "$GITHUB_STEP_SUMMARY"
+              echo "确认 wing main 需要的 \`Marshaller.Bytes\` 仍在后重新构建。" >> "$GITHUB_STEP_SUMMARY"
+            } || true
+            echo "::warning title=dae-core pin stale::落后 $BEHIND 个 commit，产物仍可构建但内核不是 dae 最新"
+            exit 1
+          fi
+
+          # pin 不在上游 main 的祖先链上：可能被 revert、force-push 或写错。
+          {
+            echo "## dae-core pin 与 dae main 无祖先关系" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`$PINNED\` 不是 \`$UPSTREAM\` 的祖先。pin 可能已被 revert 或 force-push 掉，" >> "$GITHUB_STEP_SUMMARY"
+            echo "必须人工确认后再使用这个产物。" >> "$GITHUB_STEP_SUMMARY"
+          } || true
+          echo "::error title=dae-core pin diverged::pin 不是 dae main 的祖先，需人工确认"
+          exit 1
 
       - name: Show pinned revisions
         run: |
