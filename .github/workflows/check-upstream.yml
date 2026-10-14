@@ -180,6 +180,48 @@ jobs:
             || { echo "::error::wing 指针回读不一致"; exit 1; }
           echo "wing -> $NEW"
 
+      # 与上游做法的差异 ④：bump wing 后，验证 wing 依赖的 dae API 在当前 pin 里还在。
+      # 上一道检查只覆盖「bump dae-core」，但 bump wing 有同样的风险——新版 wing
+      # 可能要求 dae 侧更新过的 API。wing 通过 go.mod 的 replace 编译期绑定 ./dae-core，
+      # 缺符号就是 make deps 阶段编译失败，那时才知道就晚了。
+      - name: Safety check - wing 依赖的 dae API 在当前 pin 中存在
+        if: needs.check.outputs.need_wing == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PIN="$(sed -nE 's/^[[:space:]]*DAECORE=([0-9a-f]{40}).*/\1/p' .github/workflows/build-custom.yml | head -1)"
+          [ -n "$PIN" ] || { echo "::error::解析不出 DAECORE"; exit 1; }
+          echo "验证 pin=$PIN 是否仍提供 wing 依赖的符号"
+
+          # 这三个符号是 dae-wing 直接 import 并调用的导出符号，缺任何一个都编不过：
+          #   dae/flat_desc.go   -> daeConfig.Config / Desc / SectionDescription
+          #   dae/httpclient.go  -> consts.OutboundControlPlaneRouting / control.RouteDialParam
+          MISSING=""
+          gh api "repos/daeuniverse/dae/contents/control/tcp.go?ref=$PIN" --jq '.content' \
+            | base64 -d | grep -qE 'type RouteDialParam struct' \
+            || MISSING="$MISSING control.RouteDialParam(control/tcp.go)"
+          gh api "repos/daeuniverse/dae/contents/common/consts/ebpf.go?ref=$PIN" --jq '.content' \
+            | base64 -d | grep -qE 'OutboundControlPlaneRouting' \
+            || MISSING="$MISSING consts.OutboundControlPlaneRouting(common/consts/ebpf.go)"
+          gh api "repos/daeuniverse/dae/contents/config/desc.go?ref=$PIN" --jq '.content' \
+            | base64 -d | grep -qE 'SectionDescription' \
+            || MISSING="$MISSING config.SectionDescription(config/desc.go)"
+
+          if [ -n "$MISSING" ]; then
+            {
+              echo "## ⛔ 未 bump wing：dae-core pin 缺少 wing 依赖的 API"
+              echo ""
+              echo "缺失符号: \`$MISSING\`"
+              echo ""
+              echo "pin \`$PIN\` 无法满足新版 dae-wing 的编译需求，直接 bump 会导致 make deps 失败。"
+              echo "需要先升级 dae-core pin，按操作手册 §4.1 处理。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=wing 依赖缺失，放弃自动 bump::$MISSING"
+            exit 1
+          fi
+          echo "::notice::wing 依赖的 3 个 dae API 在 pin 中均存在，可安全 bump"
+
       - name: Verify custom changes intact
         run: |
           set -euo pipefail
