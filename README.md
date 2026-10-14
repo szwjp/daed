@@ -50,10 +50,16 @@ daed (React 前端)              ← 本 fork main
 
 | 时机 | 检查 | 拦住什么 |
 |---|---|---|
-| bump dae-core 前 | `Marshaller.Bytes()` 存在 | 上游重构了 wing 依赖的 API |
-| bump wing 后 | 3 个 dae 导出符号存在 | 新版 wing 要的 API 当前 pin 没有 |
-| push 前 | 6 处本地定制指纹 | merge 覆盖了定制内容 |
+| bump dae-core 前 | 新 pin 的 `Marshaller.Bytes()` 存在 | 上游重构了 wing 依赖的 API |
+| bump wing 后 | 4 个 dae 导出符号存在 | 新版 wing 要的 API 当前 pin 没有 |
+| push 前 / merge 后 | `hack/check-fork-customizations.sh` 指纹（当前 8 项） | merge 覆盖了定制内容 |
 | push 后 | `Assert dae-core pin matches dae main` | pin 与 dae main 不一致 |
+
+失败时（任一 job 红）会自动开一个 issue 记录 run 链接；已有同名 open issue 时只追加评论。
+step summary（run 页面 Summary 标签）里也会写明具体缺什么。
+
+**关于定时触发**：schedule 依赖 GitHub 的定时器——fork 里的 scheduled workflow 需要手动启用，
+且公开仓库 60 天无仓库活动会被自动禁用。发现每天不再自动跑时，去 Actions 页面重新启用即可。
 
 ### 红灯含义
 
@@ -62,15 +68,18 @@ daed (React 前端)              ← 本 fork main
 | `pin stale` warning | dae 上游有更新，pin 落后 N 个 commit | 按 §5 更新 pin |
 | `pin diverged` error | pin 不是 dae main 的祖先（上游 force-push/revert） | 读上游历史，人工判断 |
 | `API 变更，放弃自动 bump` | wing 依赖的 dae API 消失 | 读上游 commit，评估替代方案 |
+| `wing 依赖缺失，放弃自动 bump` | 当前 pin 缺少新版 wing 需要的符号 | 先升级 pin（§5） |
+| `读取上游失败` | 404/网络/限流导致判断不了（不是 API 变更） | 重跑一次即可 |
 | `merge 有冲突` | 上游改了本 fork 定制过的文件 | 人工解冲突，见 §6 |
 
 **step summary（run 页面 Summary 标签）里会写明具体缺什么。**
 
 ---
 
-## 3. 本 fork 的本地定制（6 处）
+## 3. 本 fork 的本地定制
 
 merge 上游或 bump 时丢失任何一处，都会被指纹检查拦住。
+清单以 `hack/check-fork-customizations.sh` 为准（项数由脚本自己数，避免文档与代码对不上）。
 
 ### 3.1 Header 显示内核版本
 
@@ -218,7 +227,7 @@ git merge upstream/main
 | `apps/web/src/pages/Setup.tsx` | 保留 `useEffect` 回退块 |
 | `apps/web/src/i18n/locales/*.json` | 两个 `coreVersion` 都保留 |
 
-解完跑一遍指纹校验（见 §7）确认 6 处定制都在，再 push。
+解完跑一遍指纹校验（见 §7）确认定制都在，再 push。
 
 ---
 
@@ -231,19 +240,8 @@ echo "DAECORE : $(gh api 'repos/szwjp/daed/contents/dae-core.pin?ref=main' --jq 
 gh api repos/daeuniverse/dae/commits/main      --jq '"dae      : \(.sha[0:8])"'
 gh api repos/daeuniverse/dae-wing/commits/main --jq '"dae-wing : \(.sha[0:8])"'
 
-# 6 处定制指纹
-cd <repo>
-for f in "general.dae.version:apps/web/src/components/Header.tsx" \
-         "coreVersion:apps/web/src/i18n/locales/zh-Hans.json" \
-         "coreVersion:apps/web/src/i18n/locales/en.json" \
-         "DEFAULT_ENDPOINT_URL:apps/web/src/contexts/index.tsx" \
-         "endpoint unreachable:apps/web/src/pages/Setup.tsx" \
-         "szwjp/daed:README.md" \
-         "Assert dae-core pin:.github/workflows/build-custom.yml"; do
-  k="${f%%:*}"; p="${f##*:}"
-  grep -q "$k" "$p" && echo "✓ $p" || echo "✗ $p 缺失"
-done
-[ -f .github/workflows/release-please.yml ] && echo "✗ release-please.yml 被恢复" || echo "✓ release-please.yml 保持删除"
+# 自有改动指纹（与 check-upstream 用的是同一份清单，脚本自己报项数）
+cd <repo> && bash hack/check-fork-customizations.sh
 
 # 最近构建
 gh run list --repo szwjp/daed --limit 5

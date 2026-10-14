@@ -1,12 +1,21 @@
 name: Check Upstream
 
 # 借鉴 QiuSimons/luci-app-daed 的 autoupdate.yml 骨架（定时查三个上游、发现更新就处理），
-# 但有三处刻意不同，见下方"与上游做法的差异"。
+# 但有四处刻意不同，见各步骤上方的 ① ② ③ ④ 注释：
+#   ① bump dae-core 前校验 wing 依赖的 dae API 仍在（上游不做这个检查）
+#   ② dae-core pin 存普通文件 dae-core.pin，不动 .github/workflows/
+#      （GITHUB_TOKEN 没有 workflows 权限，改 workflow 文件的 push 会被服务端拒绝）
+#   ③ submodule 指针用 git 命令改，不用 sed 改文本
+#   ④ bump wing 后校验 wing 依赖的 dae 导出符号在当前 pin 中仍存在
 #
 # 本文件只负责"把指针推到该去的位置"，最终把关交给 build-custom.yml 里
-# 那道 `Assert dae-core pin matches dae main` 断言——它在 push 后自动触发。
+# 那道 `Assert dae-core pin matches dae main` 断言——它由本文件在 push 后显式触发
+# （GITHUB_TOKEN 的 push 事件不会创建新的 workflow run）。
 #
-# 操作手册：见桌面的 daed-build-manual.md（bump 异常时看 §4 / §7）
+# 操作手册：README.md §5（手动 bump）/ §6（人工解 merge 冲突）/ §7（验证命令）
+#
+# 注意：公开仓库的 scheduled workflow 在 60 天无活动后会被 GitHub 自动禁用，
+# fork 里的 schedule 也需要手动启用；发现定时不再触发时去 Actions 页面重新启用。
 
 on:
   workflow_dispatch:
@@ -19,6 +28,8 @@ permissions:
   # 原因：GITHUB_TOKEN 触发的 push 事件不会创建新的 workflow run
   # （workflow_dispatch / repository_dispatch 例外），所以不能指望 push 自动带起下游。
   actions: write
+  # 失败时把 run 记到 issue 里（见文件末尾 notify job）
+  issues: write
 
 concurrency:
   group: check-upstream
@@ -27,6 +38,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       need_dae: ${{ steps.probe.outputs.need_dae }}
       need_wing: ${{ steps.probe.outputs.need_wing }}
@@ -63,22 +75,30 @@ jobs:
           DAE_OLD="$(sed -nE 's/^([0-9a-f]{40})[[:space:]]*$/\1/p' dae-core.pin | head -1)"
           WING_OLD="$(git -C wing rev-parse HEAD)"
           DAED_OLD="$(git rev-parse HEAD)"
-
-          echo "dae   : $DAE_OLD -> $DAE_NEW"
-          echo "wing  : ${WING_OLD:0:8} -> ${WING_NEW:0:8}"
-          echo "daed  : ${DAED_OLD:0:8} -> ${DAED_NEW:0:8}"
-
           [ -n "$DAE_OLD" ] || { echo "::error::未能从 dae-core.pin 解析出 40 位 sha"; exit 1; }
 
           need_dae=false;  [ "$DAE_OLD"  = "$DAE_NEW"  ] || need_dae=true
           need_wing=false; [ "$WING_OLD" = "$WING_NEW" ] || need_wing=true
-          need_daed=false; [ "$DAED_OLD" = "$DAED_NEW" ] || need_daed=true
 
-          # 落后多少个 commit（用于写进提交信息和 step summary）
+          # daed 层不能用 SHA 相等判断：本 fork 有自己的提交，HEAD 永远不等于上游 tip，
+          # 那样 need_daed 恒为 true（每天白跑一次 merge，且真有更新时也判断不出差别）。
+          # 正确语义是「上游还有没有本 fork 缺的提交」，用 compare API 的 ahead_by。
+          daed_behind="$(gh api "repos/daeuniverse/daed/compare/$DAED_OLD...$DAED_NEW" --jq '.ahead_by' 2>/dev/null || true)"
+          if [ -z "$daed_behind" ]; then
+            echo "::warning::compare API 取不到 daed 落后数，保守按「上游有更新」处理"
+            need_daed=true; daed_behind="?"
+          elif [ "$daed_behind" -gt 0 ] 2>/dev/null; then
+            need_daed=true
+          else
+            need_daed=false; daed_behind=0
+          fi
+
+          # 落后多少个 commit（用于提交信息 / step summary）。
+          # dae-core 用 submodule 自己的克隆算，不要把上游对象 fetch 进本仓库。
           dae_commits=0
           if [ "$need_dae" = true ]; then
-            git fetch -q https://github.com/daeuniverse/dae.git main
-            dae_commits="$(git rev-list --count "$DAE_OLD..$DAE_NEW" 2>/dev/null || echo '?')"
+            git -C wing/dae-core fetch -q origin main
+            dae_commits="$(git -C wing/dae-core rev-list --count "$DAE_OLD..$DAE_NEW" 2>/dev/null || echo '?')"
           fi
           wing_commits=0
           if [ "$need_wing" = true ]; then
@@ -86,15 +106,13 @@ jobs:
             wing_commits="$(git -C wing rev-list --count "$WING_OLD..$WING_NEW" 2>/dev/null || echo '?')"
           fi
 
-          # 自有改动指纹：merge 上游 daed 后必须还在，否则说明被覆盖了
+          echo "dae   : ${DAE_OLD:0:8} -> ${DAE_NEW:0:8}  (behind $dae_commits)"
+          echo "wing  : ${WING_OLD:0:8} -> ${WING_NEW:0:8}  (behind $wing_commits)"
+          echo "daed  : ${DAED_OLD:0:8} -> ${DAED_NEW:0:8}  (behind $daed_behind)"
+
+          # 自有改动指纹：push 前与 merge 后共用同一份脚本，避免两处清单漂移
           custom_check=ok
-          if ! grep -q 'szwjp/daed' README.md; then custom_check=missing; fi
-          if ! grep -q 'general.dae.version' apps/web/src/components/Header.tsx \
-             || ! grep -q 'coreVersion' apps/web/src/i18n/locales/zh-Hans.json \
-             || ! grep -q 'DEFAULT_ENDPOINT_URL' apps/web/src/contexts/index.tsx \
-             || ! grep -q 'Assert dae-core pin matches dae main' .github/workflows/build-custom.yml; then
-            custom_check=missing
-          fi
+          if ! bash hack/check-fork-customizations.sh; then custom_check=missing; fi
 
           {
             echo "need_dae=$need_dae"
@@ -110,11 +128,11 @@ jobs:
           {
             echo "## 上游检查"
             echo ""
-            echo "| 层 | 本地 | 上游 | 需要更新 |"
-            echo "|---|---|---|---|"
-            echo "| dae-core | ${DAE_OLD:0:8} | ${DAE_NEW:0:8} | $need_dae |"
-            echo "| dae-wing | ${WING_OLD:0:8} | ${WING_NEW:0:8} | $need_wing |"
-            echo "| daed | ${DAED_OLD:0:8} | ${DAED_NEW:0:8} | $need_daed |"
+            echo "| 层 | 本地 | 上游 | 需要更新 | 落后 |"
+            echo "|---|---|---|---|---|"
+            echo "| dae-core | ${DAE_OLD:0:8} | ${DAE_NEW:0:8} | $need_dae | $dae_commits |"
+            echo "| dae-wing | ${WING_OLD:0:8} | ${WING_NEW:0:8} | $need_wing | $wing_commits |"
+            echo "| daed | ${DAED_OLD:0:8} | ${DAED_NEW:0:8} | $need_daed | $daed_behind |"
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$need_dae$need_wing$need_daed" = "falsefalsefalse" ]; then
@@ -125,6 +143,7 @@ jobs:
     needs: check
     if: needs.check.outputs.need_dae == 'true' || needs.check.outputs.need_wing == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       # 这个 job 要 push：不能用 persist-credentials: false，否则 checkout 结束前
       # 凭据就被删掉，后面的 git push 必然以「could not read Username」失败。
@@ -146,9 +165,15 @@ jobs:
         run: |
           set -euo pipefail
           NEW="${{ needs.check.outputs.dae_new }}"
-          if gh api "repos/daeuniverse/dae/contents/config/marshal.go?ref=$NEW" --jq '.content' 2>/dev/null \
-               | base64 -d 2>/dev/null \
-               | grep -qE 'func \(m \*Marshaller\) Bytes\(\)'; then
+          [[ "$NEW" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::dae_new 不是合法 sha: '$NEW'"; exit 1; }
+
+          # 先区分「读不到」和「读到了但符号不在」：404/网络/限流不能当成 API 变更，
+          # 否则会误报「上游重构了 API」并要求人工介入。
+          if ! gh api "repos/daeuniverse/dae/contents/config/marshal.go?ref=$NEW" --jq '.content' > /tmp/marshal.b64; then
+            echo "::error title=读取上游失败::marshal.go@$NEW 读取失败（404/网络/限流），无法判断，本次不 bump，请重跑"
+            exit 1
+          fi
+          if base64 -d /tmp/marshal.b64 | grep -qE 'func \(m \*Marshaller\) Bytes\(\)'; then
             echo "::notice::Marshaller.Bytes 在 $NEW 中存在，可以安全 bump"
             exit 0
           fi
@@ -158,7 +183,7 @@ jobs:
             echo "\`Marshaller.Bytes()\`（\`config/marshal.go\`）在 dae \`$NEW\` 中不存在或已重构。"
             echo "wing main 依赖该方法，自动 bump 会导致构建失败。"
             echo ""
-            echo "需要人工介入，按操作手册 §4.1 处理。"
+            echo "需要人工介入，按 README §5 手动处理。"
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::error title=dae API 变更，放弃自动 bump::Marshaller.Bytes 已消失，需人工确认"
           exit 1
@@ -193,10 +218,14 @@ jobs:
             || { echo "::error::wing 指针回读不一致"; exit 1; }
           echo "wing -> $NEW"
 
-      # 与上游做法的差异 ④：bump wing 后，验证 wing 依赖的 dae API 在当前 pin 里还在。
+      # 与上游做法的差异 ④：bump wing 后，验证 wing 依赖的 dae 导出符号在当前 pin 里还在。
       # 上一道检查只覆盖「bump dae-core」，但 bump wing 有同样的风险——新版 wing
       # 可能要求 dae 侧更新过的 API。wing 通过 go.mod 的 replace 编译期绑定 ./dae-core，
       # 缺符号就是 make deps 阶段编译失败，那时才知道就晚了。
+      #
+      # 这几个是 wing 直接 import 并调用、缺了必编译失败的符号。Marshaller.Bytes 尤其关键：
+      # 它正是 dae #1117 为 wing 补的（wing 自己锁的 dbae2e82 里没有这个方法）。
+      # 更彻底的替代是在 runner 上按「新 wing + 新 pin」跑一次 go build（成本高，暂不做）。
       - name: Safety check - wing 依赖的 dae API 在当前 pin 中存在
         if: needs.check.outputs.need_wing == 'true'
         env:
@@ -207,20 +236,23 @@ jobs:
           [ -n "$PIN" ] || { echo "::error::解析不出 dae-core.pin"; exit 1; }
           echo "验证 pin=$PIN 是否仍提供 wing 依赖的符号"
 
-          # 这三个符号是 dae-wing 直接 import 并调用的导出符号，缺任何一个都编不过：
-          #   dae/flat_desc.go   -> daeConfig.Config / Desc / SectionDescription
-          #   dae/httpclient.go  -> consts.OutboundControlPlaneRouting / control.RouteDialParam
-          MISSING=""
-          gh api "repos/daeuniverse/dae/contents/control/tcp.go?ref=$PIN" --jq '.content' \
-            | base64 -d | grep -qE 'type RouteDialParam struct' \
-            || MISSING="$MISSING control.RouteDialParam(control/tcp.go)"
-          gh api "repos/daeuniverse/dae/contents/common/consts/ebpf.go?ref=$PIN" --jq '.content' \
-            | base64 -d | grep -qE 'OutboundControlPlaneRouting' \
-            || MISSING="$MISSING consts.OutboundControlPlaneRouting(common/consts/ebpf.go)"
-          gh api "repos/daeuniverse/dae/contents/config/desc.go?ref=$PIN" --jq '.content' \
-            | base64 -d | grep -qE 'SectionDescription' \
-            || MISSING="$MISSING config.SectionDescription(config/desc.go)"
+          MISSING=""; UNREADABLE=""
+          # $1=路径 $2=正则 $3=标签。"读不到"与"符号缺失"分开记：404/限流不能报成 API 变更。
+          check_symbol() {
+            if ! gh api "repos/daeuniverse/dae/contents/$1?ref=$PIN" --jq '.content' > /tmp/sym.b64; then
+              UNREADABLE="${UNREADABLE:+$UNREADABLE }$3($1)"; return 0
+            fi
+            base64 -d /tmp/sym.b64 | grep -qE "$2" || MISSING="${MISSING:+$MISSING }$3($1)"
+          }
+          check_symbol config/marshal.go     'func \(m \*Marshaller\) Bytes\(\)' 'Marshaller.Bytes'
+          check_symbol control/tcp.go        'type RouteDialParam struct'          'control.RouteDialParam'
+          check_symbol common/consts/ebpf.go 'OutboundControlPlaneRouting'         'consts.OutboundControlPlaneRouting'
+          check_symbol config/desc.go        'SectionDescription'                  'config.SectionDescription'
 
+          if [ -n "$UNREADABLE" ]; then
+            echo "::error title=读取上游失败::这些文件读不到（404/网络/限流），无法判断，本次不 bump wing:$UNREADABLE"
+            exit 1
+          fi
           if [ -n "$MISSING" ]; then
             {
               echo "## ⛔ 未 bump wing：dae-core pin 缺少 wing 依赖的 API"
@@ -228,12 +260,12 @@ jobs:
               echo "缺失符号: \`$MISSING\`"
               echo ""
               echo "pin \`$PIN\` 无法满足新版 dae-wing 的编译需求，直接 bump 会导致 make deps 失败。"
-              echo "需要先升级 dae-core pin，按操作手册 §4.1 处理。"
+              echo "需要先升级 dae-core pin，按 README §5 手动处理。"
             } >> "$GITHUB_STEP_SUMMARY"
             echo "::error title=wing 依赖缺失，放弃自动 bump::$MISSING"
             exit 1
           fi
-          echo "::notice::wing 依赖的 3 个 dae API 在 pin 中均存在，可安全 bump"
+          echo "::notice::wing 依赖的 4 个 dae 符号在 pin 中均存在，可安全 bump"
 
       - name: Verify custom changes intact
         run: |
@@ -285,6 +317,7 @@ jobs:
     needs: [check, bump]
     if: always() && needs.check.outputs.need_daed == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       # 这个 job 要 push：同样不能 persist-credentials: false（凭据在 checkout 结束前就被删）。
       - uses: actions/checkout@v6
@@ -331,19 +364,20 @@ jobs:
               echo "本 fork 相对上游是 **diverged**（既有自有改动，又落后上游提交），"
               echo "**已放弃自动合并**，仓库保持原状。"
               echo ""
-              echo "需要人工处理，按操作手册 §5「同步上游 daed」的流程走。"
+              echo "需要人工处理，按 README §6「人工解 merge 冲突」的流程走。"
             } >> "$GITHUB_STEP_SUMMARY"
-            echo "::error title=daed merge 冲突::需人工处理，见操作手册 §5"
+            echo "::error title=daed merge 冲突::需人工处理，见 README §6"
           else
             echo "::warning::merge 返回 $RC 但无冲突文件，说明是命令本身失败，不是内容冲突"
             git merge --abort 2>/dev/null || true
             {
               echo "## ⛔ daed merge 命令失败（非内容冲突）"
               echo ""
-              echo "\`git merge\` 退出码 $RC，且冲突文件列表为空——这不是内容冲突，"
-              echo "而是命令执行本身出错（例如 git identity 未配置、磁盘问题）。"
+              echo "\`git merge\` 退出码 $RC，且冲突文件列表为空——这不是内容冲突。"
+              echo "git identity 已在前面配好并回读校验过，常见原因是 unrelated histories、"
+              echo "fetch 不完整或磁盘问题；本步骤日志里有 git 的原始报错。"
               echo ""
-              echo "仓库保持原状。请看该步骤日志定位。"
+              echo "仓库保持原状。"
             } >> "$GITHUB_STEP_SUMMARY"
             echo "::error title=daed merge 命令失败::非内容冲突，见步骤日志"
           fi
@@ -355,21 +389,8 @@ jobs:
         if: env.MERGE_CLEAN == 'true'
         run: |
           set -euo pipefail
-          MISSING=""
-          grep -q 'general.dae.version'  apps/web/src/components/Header.tsx              || MISSING="$MISSING Header.tsx(coreVersion)"
-          grep -q 'coreVersion'            apps/web/src/i18n/locales/zh-Hans.json         || MISSING="$MISSING zh-Hans.json"
-          grep -q 'coreVersion'            apps/web/src/i18n/locales/en.json              || MISSING="$MISSING en.json"
-          grep -q 'DEFAULT_ENDPOINT_URL'   apps/web/src/contexts/index.tsx                || MISSING="$MISSING contexts/index.tsx"
-          grep -q 'endpoint unreachable'    apps/web/src/pages/Setup.tsx                  || MISSING="$MISSING Setup.tsx"
-          grep -q 'szwjp/daed'              README.md                                     || MISSING="$MISSING README.md"
-          grep -q 'Assert dae-core pin'    .github/workflows/build-custom.yml            || MISSING="$MISSING build-custom.yml"
-          [ -f .github/workflows/release-please.yml ] && MISSING="$MISSING release-please.yml(被恢复)"
-
-          if [ -n "$MISSING" ]; then
-            echo "::error::merge 后自有改动丢失:$MISSING"
-            exit 1
-          fi
-          echo "merge 后 6 处自有改动全部完好"
+          # 与 check job 的 custom_check 共用同一份脚本，避免两处清单漂移
+          bash hack/check-fork-customizations.sh
 
       # P0-A：git merge 自己已经生成了 merge commit，这里绝不能再 commit 一次——
       # 之前的写法 `git commit ... || { exit 0; }` 会命中 "nothing to commit" 而
@@ -398,4 +419,30 @@ jobs:
           else
             gh workflow run build-custom.yml --repo "$GITHUB_REPOSITORY" --ref main
             echo "已显式触发 build-custom.yml"
+          fi
+
+  # 失败可见性：上面三个 job 任意一个红，就确保有一个 open issue 记录这些失败。
+  # 已有同标题的 open issue 时只追加评论，避免每天刷屏。
+  notify:
+    needs: [check, bump, sync-daed]
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Report failure as an issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TITLE="check-upstream 自动同步失败"
+          BODY="$(printf '上游检查/同步失败，需要人工看一下。\n\n- run: %s/%s/actions/runs/%s\n- 提交: %s\n- 事件: %s\n\n排查：run 页面的 Summary 标签 → README §2 四道关口 → 需要手动时看 §5（bump）/ §6（解 merge 冲突）。\n' \
+            "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_SHA" "$GITHUB_EVENT_NAME")"
+          EXIST="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
+                    --json number,title --jq ".[] | select(.title == \"$TITLE\") | .number" 2>/dev/null | head -1 || true)"
+          if [ -n "$EXIST" ]; then
+            gh issue comment "$EXIST" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+            echo "已在已有 issue #$EXIST 追加失败记录"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY"
+            echo "已创建失败 issue"
           fi
