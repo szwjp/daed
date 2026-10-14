@@ -6,6 +6,9 @@ name: Build daed bundle (linux/amd64)
 # 与官方构建相比的差异：
 #   1) 显式安装 clang/llvm（官方 workflow 依赖 runner 预装，ebpf 那步容易挂）
 #   2) 前端从源码构建（含自定义 UI：Header 显示内核版本），不再用官方 web.zip
+#   3) dae-core pin 放在仓库根目录的普通文件 dae-core.pin（一行 40 位 sha），
+#      不写在本文件里：GITHUB_TOKEN 没有 workflows 权限，自动 bump 一旦改动
+#      .github/workflows/ 下的文件，push 就会被服务端拒绝。
 
 on:
   workflow_dispatch:
@@ -30,10 +33,15 @@ jobs:
       - name: Pin dae-core to main (wing main requires Marshaller.Bytes, restored in #1117)
         id: pin
         run: |
-          DAECORE=e3fee8fbc68a65167af13b685ab0b958757e20ee
+          set -euo pipefail
+          DAECORE="$(sed -nE 's/^([0-9a-f]{40})[[:space:]]*$/\1/p' dae-core.pin | head -1)"
+          [ -n "$DAECORE" ] || { echo "::error::dae-core.pin 里没有合法的 40 位 sha"; exit 1; }
+          echo "dae-core.pin: $DAECORE"
           git -C wing/dae-core fetch --depth 1 origin "$DAECORE"
           git -C wing/dae-core checkout -q "$DAECORE"
           git -C wing/dae-core submodule update --init --recursive
+          [ "$(git -C wing/dae-core rev-parse HEAD)" = "$DAECORE" ] \
+            || { echo "::error::dae-core 指针回读不一致"; exit 1; }
           echo "sha=$DAECORE" >> "$GITHUB_OUTPUT"
 
       # 断言：pin 的 dae-core 是否仍等于 dae main 的 tip。
@@ -71,7 +79,7 @@ jobs:
               echo "- 落后  : **$BEHIND** 个 commit" >> "$GITHUB_STEP_SUMMARY"
               echo "- main  : $SUBJECT" >> "$GITHUB_STEP_SUMMARY"
               echo "" >> "$GITHUB_STEP_SUMMARY"
-              echo "更新 pin：改 build-custom.yml 里 pin 步骤的 DAECORE，" >> "$GITHUB_STEP_SUMMARY"
+              echo "更新 pin：改仓库根目录的 dae-core.pin（一行 40 位 sha），" >> "$GITHUB_STEP_SUMMARY"
               echo "确认 wing main 需要的 \`Marshaller.Bytes\` 仍在后重新构建。" >> "$GITHUB_STEP_SUMMARY"
             } || true
             echo "::warning title=dae-core pin stale::落后 $BEHIND 个 commit，产物仍可构建但内核不是 dae 最新"

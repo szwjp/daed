@@ -31,11 +31,20 @@ daed (React 前端)              ← 本 fork main
 
 | 层 | 更新方式 | 有更新时 |
 |---|---|---|
-| **dae-core** | 改 `build-custom.yml` 里的 `DAECORE=` | 自动 bump + 推送 |
+| **dae-core** | 改根目录 `dae-core.pin`（一行 40 位 sha） | 自动 bump + 推送 |
 | **dae-wing** | `git -C wing checkout` submodule | 自动 bump + 推送 |
 | **daed** | `git merge upstream/main` | merge 干净才自动推；冲突则停下 |
 
-推送后自动触发 `build-custom.yml`，由它构建并做最终把关。
+**pin 为什么放在 `dae-core.pin` 这种普通文件里**：`GITHUB_TOKEN` 没有 `workflows` 权限，
+自动 bump 一旦改动 `.github/workflows/` 下的文件，push 会被服务端拒绝
+（`refusing to allow a GitHub App to create or update workflow ... without workflows permission`）。
+
+**推送后怎么触发构建**：`GITHUB_TOKEN` 触发的 push 事件**不会**创建新的 workflow run
+（只有 `workflow_dispatch` / `repository_dispatch` 例外），所以推送后由 workflow 自己
+`gh workflow run build-custom.yml` 显式触发。若在仓库里配了 `SYNC_TOKEN`
+（fine-grained PAT 或 GitHub App token，需要 **Contents: r/w + Workflows: r/w**），
+推送就走它，push 事件会自动触发构建，workflow 不再重复 dispatch；同时上游改动
+自己 workflow 文件时也能正常同步（GITHUB_TOKEN 做不到）。
 
 ### 四道关口
 
@@ -97,6 +106,7 @@ merge 上游或 bump 时丢失任何一处，都会被指纹检查拦住。
 
 - 显式安装 clang/llvm（官方依赖 runner 预装，eBPF 那步容易挂）
 - 前端从源码构建（带 3.1 的 UI 改动），不用官方 web.zip
+- dae-core pin 读根目录的 `dae-core.pin`（3 个 workflow 文件之外，便于自动 bump 推送）
 - 加了 pin 一致性断言（§2）
 
 ### 3.5 `release-please.yml`（已删除）
@@ -169,7 +179,7 @@ gh api repos/daeuniverse/dae/commits/main --jq '.sha'
 gh api repos/daeuniverse/dae/contents/config/marshal.go --jq '.content' \
   | base64 -d | grep -E 'func \(m \*Marshaller\) Bytes\(\)'
 
-# 3. 改 .github/workflows/build-custom.yml 里那行 DAECORE=<新 sha>
+# 3. 改根目录的 dae-core.pin（一行 40 位 sha）
 
 # 4. 推送，触发构建
 git commit -am "build(deps): bump dae-core to <短sha>"
@@ -217,7 +227,7 @@ git merge upstream/main
 ```bash
 # 三层指针
 echo "wing    : $(gh api 'repos/szwjp/daed/contents/wing?ref=main' --jq '.sha[0:8]')"
-echo "DAECORE : $(gh api 'repos/szwjp/daed/contents/.github/workflows/build-custom.yml?ref=main' --jq '.content' | base64 -d | sed -nE 's/^[[:space:]]*DAECORE=([0-9a-f]{40}).*/\1/p' | cut -c1-8)"
+echo "DAECORE : $(gh api 'repos/szwjp/daed/contents/dae-core.pin?ref=main' --jq '.content' | base64 -d | cut -c1-8)"
 gh api repos/daeuniverse/dae/commits/main      --jq '"dae      : \(.sha[0:8])"'
 gh api repos/daeuniverse/dae-wing/commits/main --jq '"dae-wing : \(.sha[0:8])"'
 

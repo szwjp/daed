@@ -15,6 +15,10 @@ on:
 
 permissions:
   contents: write
+  # 推送后显式触发 build-custom.yml 需要 actions: write。
+  # 原因：GITHUB_TOKEN 触发的 push 事件不会创建新的 workflow run
+  # （workflow_dispatch / repository_dispatch 例外），所以不能指望 push 自动带起下游。
+  actions: write
 
 concurrency:
   group: check-upstream
@@ -53,8 +57,10 @@ jobs:
           WING_NEW="$(cat /tmp/wing.sha)"
           DAED_NEW="$(cat /tmp/daed.sha)"
 
-          # 本地 pin 值。DAECORE 从 workflow 里读，不用行号，按变量名匹配。
-          DAE_OLD="$(sed -nE 's/^[[:space:]]*DAECORE=([0-9a-f]{40}).*/\1/p' .github/workflows/build-custom.yml | head -1)"
+          # 本地 pin 值。dae-core pin 放在仓库根目录的普通文件 dae-core.pin（一行 40 位 sha）。
+          # 放普通文件而不是 workflow 里，是为了让自动 bump 不触碰 .github/workflows/——
+          # GITHUB_TOKEN 没有 workflows 权限，改 workflow 文件的 push 会被服务端拒绝。
+          DAE_OLD="$(sed -nE 's/^([0-9a-f]{40})[[:space:]]*$/\1/p' dae-core.pin | head -1)"
           WING_OLD="$(git -C wing rev-parse HEAD)"
           DAED_OLD="$(git rev-parse HEAD)"
 
@@ -62,7 +68,7 @@ jobs:
           echo "wing  : ${WING_OLD:0:8} -> ${WING_NEW:0:8}"
           echo "daed  : ${DAED_OLD:0:8} -> ${DAED_NEW:0:8}"
 
-          [ -n "$DAE_OLD" ] || { echo "::error::未能从 build-custom.yml 解析出 DAECORE"; exit 1; }
+          [ -n "$DAE_OLD" ] || { echo "::error::未能从 dae-core.pin 解析出 40 位 sha"; exit 1; }
 
           need_dae=false;  [ "$DAE_OLD"  = "$DAE_NEW"  ] || need_dae=true
           need_wing=false; [ "$WING_OLD" = "$WING_NEW" ] || need_wing=true
@@ -120,11 +126,15 @@ jobs:
     if: needs.check.outputs.need_dae == 'true' || needs.check.outputs.need_wing == 'true'
     runs-on: ubuntu-latest
     steps:
+      # 这个 job 要 push：不能用 persist-credentials: false，否则 checkout 结束前
+      # 凭据就被删掉，后面的 git push 必然以「could not read Username」失败。
+      # token 可选覆盖：配了 secrets.SYNC_TOKEN（PAT/App token，Contents+Workflows
+      # 读写）就能连上游 workflow 文件的改动一起推，并让 push 事件自动触发下游构建。
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           submodules: recursive
-          persist-credentials: false
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
 
       # 与上游做法的差异 ①：bump 前验证 wing 依赖的 dae API 还在。
       # QiuSimons 直接把 CORE 设成 main tip，不做这个检查，API 消失后要到
@@ -153,19 +163,21 @@ jobs:
           echo "::error title=dae API 变更，放弃自动 bump::Marshaller.Bytes 已消失，需人工确认"
           exit 1
 
-      # 与上游做法的差异 ②：按变量名替换，不用 sed 行号。
-      # 上游用 sed -i "7 a PKG_VERSION:=..." 硬编码行号，Makefile 一改行数就静默插错位置。
+      # 与上游做法的差异 ②：pin 存仓库根目录的普通文件 dae-core.pin，不写进本 workflow。
+      # 否则自动 bump 会改动 .github/workflows/ 下的文件，而 GITHUB_TOKEN 没有
+      # workflows 权限，服务端会直接拒绝这次 push。
       - name: Bump dae-core pin
         if: needs.check.outputs.need_dae == 'true'
         run: |
           set -euo pipefail
           NEW="${{ needs.check.outputs.dae_new }}"
-          # 按变量名替换整行，不依赖行号；不用 sed 反向引用（BSD sed 不支持 \1）
-          sed -i -E "s|^[[:space:]]*DAECORE=.*|          DAECORE=$NEW|" .github/workflows/build-custom.yml
-          # 回读校验，不一致就停——绝不推一个改坏的 workflow
-          grep -qE "^[[:space:]]*DAECORE=$NEW$" .github/workflows/build-custom.yml \
-            || { echo "::error::DAECORE 替换后回读不一致"; exit 1; }
-          echo "DAECORE -> $NEW"
+          # 先校验 sha 合法性：坏值（空串/undefined）也会让"回读"假通过
+          [[ "$NEW" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::dae_new 不是合法 sha: '$NEW'"; exit 1; }
+          printf '%s\n' "$NEW" > dae-core.pin
+          # 回读校验，不一致就停——绝不推一个写坏的 pin
+          [ "$(cat dae-core.pin)" = "$NEW" ] \
+            || { echo "::error::dae-core.pin 回读不一致"; exit 1; }
+          echo "dae-core.pin -> $NEW"
 
       # 与上游做法的差异 ③：submodule 指针用 git 命令改，不用 sed。
       # 指针是 git 对象不是文本，改错会得到一个损坏的 submodule。
@@ -191,8 +203,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          PIN="$(sed -nE 's/^[[:space:]]*DAECORE=([0-9a-f]{40}).*/\1/p' .github/workflows/build-custom.yml | head -1)"
-          [ -n "$PIN" ] || { echo "::error::解析不出 DAECORE"; exit 1; }
+          PIN="$(sed -nE 's/^([0-9a-f]{40})[[:space:]]*$/\1/p' dae-core.pin | head -1)"
+          [ -n "$PIN" ] || { echo "::error::解析不出 dae-core.pin"; exit 1; }
           echo "验证 pin=$PIN 是否仍提供 wing 依赖的符号"
 
           # 这三个符号是 dae-wing 直接 import 并调用的导出符号，缺任何一个都编不过：
@@ -232,11 +244,17 @@ jobs:
           echo "自有改动指纹完整"
 
       - name: Commit and push
+        env:
+          GH_TOKEN: ${{ github.token }}
+          USING_PAT: ${{ secrets.SYNC_TOKEN != '' }}
         run: |
           set -euo pipefail
           git config user.name szwjp
           git config user.email szwjp@users.noreply.github.com
-          git add -A
+
+          # 只暂存本次真正会改的两处。不要 git add -A：checkout/merge 后工作区的
+          # submodule 可能停在旧 SHA，git add -A 会把旧指针写回 index。
+          git add dae-core.pin wing
 
           MSG="bump: 自动同步上游"
           if [ "${{ needs.check.outputs.need_dae }}" = true ]; then
@@ -245,25 +263,35 @@ jobs:
           if [ "${{ needs.check.outputs.need_wing }}" = true ]; then
             MSG="${MSG}"$'\n'"- dae-wing -> ${{ needs.check.outputs.wing_new }}（落后 ${{ needs.check.outputs.wing_commits }} 个 commit）"
           fi
-          MSG="${MSG}"$'\n\n'"wing 依赖检查: Marshaller.Bytes 存在 ✓"$'\n'"最终把关: build-custom.yml 的断言会在本次 push 后自动触发"$'\n'"若断言转红，按操作手册 §4.1 处理"
+          MSG="${MSG}"$'\n\n'"最终把关: build-custom.yml 的断言 + 编译（本次推送后触发）"
 
           git commit -q -m "$MSG"
           git push origin HEAD:main
           echo "已推送到 main"
 
+          # GITHUB_TOKEN 的 push 不会触发下游 workflow，必须显式触发；
+          # 用 PAT 推送时 push 事件自己会触发，避免重复构建。
+          if [ "$USING_PAT" = "true" ]; then
+            echo "::notice::使用 SYNC_TOKEN 推送，push 事件会自动触发 build-custom.yml"
+          else
+            gh workflow run build-custom.yml --repo "$GITHUB_REPOSITORY" --ref main
+            echo "已显式触发 build-custom.yml"
+          fi
+
   # daed 层（前端）单独一个 job：它要 merge 上游，有冲突可能，策略完全不同。
-  # 本 fork 相对上游是 diverged（ahead 2 / behind 7），必然撞 6 处自有改动，
-  # 所以这里只做「干净才自动」——撞冲突就停下来，绝不猜着解决。
+  # 本 fork 相对上游是 diverged，所以这里只做「干净才自动」——撞冲突就停下来，绝不猜着解决。
+  # needs: bump 是为了串行化：两个 job 都会 push main，并发时后推者必然 non-fast-forward 失败。
   sync-daed:
-    needs: check
-    if: needs.check.outputs.need_daed == 'true'
+    needs: [check, bump]
+    if: always() && needs.check.outputs.need_daed == 'true'
     runs-on: ubuntu-latest
     steps:
+      # 这个 job 要 push：同样不能 persist-credentials: false（凭据在 checkout 结束前就被删）。
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           submodules: recursive
-          persist-credentials: false
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
 
       # git identity 必须先设好，否则 merge 会因 empty ident 直接失败
       - name: Configure git identity
@@ -343,13 +371,31 @@ jobs:
           fi
           echo "merge 后 6 处自有改动全部完好"
 
+      # P0-A：git merge 自己已经生成了 merge commit，这里绝不能再 commit 一次——
+      # 之前的写法 `git commit ... || { exit 0; }` 会命中 "nothing to commit" 而
+      # 静默跳过 push，merge 结果全留在 runner 上、run 还是绿的。
       - name: Push merged daed
         if: env.MERGE_CLEAN == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          USING_PAT: ${{ secrets.SYNC_TOKEN != '' }}
         run: |
           set -euo pipefail
-          git config user.name szwjp
-          git config user.email szwjp@users.noreply.github.com
-          git add -A
-          git commit -q -m "merge: 同步上游 daed（自动，merge 干净）" || {
-            echo "::notice::无可提交变更"; exit 0; }
+          # merge 后把 submodule 落到新记录的 SHA，避免工作区停留在旧指针
+          git submodule update --init --recursive
+
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ]; then
+            echo "::notice::上游没有本 fork 缺的提交，无需推送"
+            exit 0
+          fi
+
           git push origin HEAD:main
+          echo "已推送到 main"
+
+          # 同 bump：GITHUB_TOKEN 推送不会触发下游 workflow，需显式触发
+          if [ "$USING_PAT" = "true" ]; then
+            echo "::notice::使用 SYNC_TOKEN 推送，push 事件会自动触发 build-custom.yml"
+          else
+            gh workflow run build-custom.yml --repo "$GITHUB_REPOSITORY" --ref main
+            echo "已显式触发 build-custom.yml"
+          fi
