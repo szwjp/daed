@@ -41,6 +41,8 @@ jobs:
 
       - name: Probe upstream
         id: probe
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           gh api repos/daeuniverse/dae/commits/main      --jq '.sha' > /tmp/dae.sha
@@ -128,6 +130,8 @@ jobs:
       # 编译失败才发现。这里提前挡住，并把原因写清楚。
       - name: Safety check - wing 依赖的 dae API 仍然存在
         if: needs.check.outputs.need_dae == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           NEW="${{ needs.check.outputs.dae_new }}"
