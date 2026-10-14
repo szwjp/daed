@@ -82,6 +82,7 @@ jobs:
 
           # 自有改动指纹：merge 上游 daed 后必须还在，否则说明被覆盖了
           custom_check=ok
+          if ! grep -q 'szwjp/daed' README.md; then custom_check=missing; fi
           if ! grep -q 'general.dae.version' apps/web/src/components/Header.tsx \
              || ! grep -q 'coreVersion' apps/web/src/i18n/locales/zh-Hans.json \
              || ! grep -q 'DEFAULT_ENDPOINT_URL' apps/web/src/contexts/index.tsx \
@@ -332,6 +333,7 @@ jobs:
           grep -q 'coreVersion'            apps/web/src/i18n/locales/en.json              || MISSING="$MISSING en.json"
           grep -q 'DEFAULT_ENDPOINT_URL'   apps/web/src/contexts/index.tsx                || MISSING="$MISSING contexts/index.tsx"
           grep -q 'endpoint unreachable'    apps/web/src/pages/Setup.tsx                  || MISSING="$MISSING Setup.tsx"
+          grep -q 'szwjp/daed'              README.md                                     || MISSING="$MISSING README.md"
           grep -q 'Assert dae-core pin'    .github/workflows/build-custom.yml            || MISSING="$MISSING build-custom.yml"
           [ -f .github/workflows/release-please.yml ] && MISSING="$MISSING release-please.yml(被恢复)"
 

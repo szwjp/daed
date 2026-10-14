@@ -1,163 +1,294 @@
-<div align="center">
-  <img src="apps/web/public/logo-rounded.png" alt="daed logo" width="120" />
-  <h1>daed</h1>
-  <p><strong>A modern web dashboard for dae</strong></p>
+# szwjp/daed
 
-  <p>
-    <a href="https://github.com/daeuniverse/daed/actions/workflows/release-please.yml"><img src="https://img.shields.io/github/actions/workflow/status/daeuniverse/daed/release-please.yml?style=for-the-badge" alt="Build Status" /></a>
-    <a href="https://github.com/daeuniverse/daed/releases"><img src="https://img.shields.io/github/v/release/daeuniverse/daed?style=for-the-badge" alt="Release" /></a>
-    <a href="https://github.com/daeuniverse/daed/blob/main/LICENSE"><img src="https://img.shields.io/github/license/daeuniverse/daed?style=for-the-badge" alt="License" /></a>
-    <a href="https://github.com/daeuniverse/daed/pulls"><img src="https://img.shields.io/github/issues-pr-closed/daeuniverse/daed?style=for-the-badge" alt="Pull Requests" /></a>
-  </p>
+> **这是 [daeuniverse/daed](https://github.com/daeuniverse/daed) 的自维护 fork。**
+> 目标：自动跟随官方 dae / dae-wing / daed 三层上游，同时保留本 fork 的本地定制。
+> 不是什么：不是发布源，不提供 release，不替代上游。
 
-  <p>
-    <a href="#features">Features</a> •
-    <a href="#getting-started">Getting Started</a> •
-    <a href="#development">Development</a> •
-    <a href="#contributing">Contributing</a> •
-    <a href="#license">License</a>
-  </p>
-</div>
+本文件记录**这个 fork 与上游的所有差异，以及为什么这么改**。
+官方 README 见 [daeuniverse/daed](https://github.com/daeuniverse/daed#readme)。
 
 ---
 
-## 📸 Screenshots
+## 1. 产物结构
 
-<details open>
-<summary><b>Desktop Screenshots</b></summary>
+三个仓库、一个二进制：
 
-|                                Setup                                |                                   Orchestrate                                   |
-| :-----------------------------------------------------------------: | :-----------------------------------------------------------------------------: |
-| <img src="docs/screenshots/pc/setup.png" alt="setup" width="400" /> | <img src="docs/screenshots/pc/orchestrate.png" alt="orchestrate" width="400" /> |
+```
+daed (React 前端)              ← 本 fork main
+  └─ wing/  → daeuniverse/dae-wing   (Go, GraphQL API)   ← submodule 指针
+       └─ dae-core/ → daeuniverse/dae (Go + eBPF, tc hook) ← CI 内 pin
+```
 
-</details>
-
-<details>
-<summary><b>Mobile Screenshots</b></summary>
-
-|                                  Setup                                  |                                     Orchestrate                                     |
-| :---------------------------------------------------------------------: | :---------------------------------------------------------------------------------: |
-| <img src="docs/screenshots/mobile/setup.png" alt="setup" width="200" /> | <img src="docs/screenshots/mobile/orchestrate.png" alt="orchestrate" width="200" /> |
-
-</details>
+编译产物是**单个二进制**（约 60MB），三者编译在一起。
+面板只通过 GraphQL 操作 dae-wing，dae-wing 通过 Go 依赖调用 dae。
 
 ---
 
-## ✨ Features
+## 2. 自动同步机制
 
-- 🎨 **Beautiful UI** — Modern, intuitive interface with light/dark mode support
-- ⌨️ **Keyboard First** — Built-in keyboard navigation and shortcuts for power users
-- 📱 **Responsive** — Fully mobile-friendly design
-- 🚀 **Fast** — Built with React and optimized for performance
+`.github/workflows/check-upstream.yml` —— 每天 UTC 00:00（北京 08:00）运行，
+也可手动 `workflow_dispatch`。
 
-## 🌐 Online Demo
+| 层 | 更新方式 | 有更新时 |
+|---|---|---|
+| **dae-core** | 改 `build-custom.yml` 里的 `DAECORE=` | 自动 bump + 推送 |
+| **dae-wing** | `git -C wing checkout` submodule | 自动 bump + 推送 |
+| **daed** | `git merge upstream/main` | merge 干净才自动推；冲突则停下 |
 
-Try daed directly in your browser without installation:
+推送后自动触发 `build-custom.yml`，由它构建并做最终把关。
 
-**🔗 [daeuniverse.github.io/daed](https://daeuniverse.github.io/daed)**
+### 四道关口
 
-> ⚠️ **Important:** Since GitHub Pages uses HTTPS, your dae-wing backend must also be served over HTTPS. Browsers block mixed content (HTTPS page connecting to HTTP backend). Configure a reverse proxy with TLS or use a self-signed certificate for local development.
+| 时机 | 检查 | 拦住什么 |
+|---|---|---|
+| bump dae-core 前 | `Marshaller.Bytes()` 存在 | 上游重构了 wing 依赖的 API |
+| bump wing 后 | 3 个 dae 导出符号存在 | 新版 wing 要的 API 当前 pin 没有 |
+| push 前 | 7 处本地定制指纹 | merge 覆盖了定制内容 |
+| push 后 | `Assert dae-core pin matches dae main` | pin 与 dae main 不一致 |
 
-## 🚀 Getting Started
+### 红灯含义
 
-Please refer to the [Quick Start Guide](./docs/getting-started.md) to start using daed right away!
+| 现象 | 含义 | 处理 |
+|---|---|---|
+| `pin stale` warning | dae 上游有更新，pin 落后 N 个 commit | 按 §5 更新 pin |
+| `pin diverged` error | pin 不是 dae main 的祖先（上游 force-push/revert） | 读上游历史，人工判断 |
+| `API 变更，放弃自动 bump` | wing 依赖的 dae API 消失 | 读上游 commit，评估替代方案 |
+| `merge 有冲突` | 上游改了本 fork 定制过的文件 | 人工解冲突，见 §6 |
 
-## 🐳 Docker Deployment
-
-Pull the prebuilt image:
-
-```bash
-docker pull ghcr.io/daeuniverse/daed
-```
-
-Run the container:
-
-```bash
-docker run -d \
-    --privileged \
-    --network=host \
-    --pid=host \
-    --restart=always \
-    -v /sys:/sys \
-    -v /etc/daed:/etc/daed \
-    --name=daed \
-    ghcr.io/daeuniverse/daed:latest
-```
-
-Or use Docker Compose:
-
-```yaml
-# docker-compose.yml
-services:
-  daed:
-    image: ghcr.io/daeuniverse/daed
-    container_name: daed
-    privileged: true
-    network_mode: host
-    pid: host
-    restart: always
-    volumes:
-      - /sys:/sys
-      - /etc/daed:/etc/daed
-```
-
-```bash
-docker compose up -d
-```
-
-Access the dashboard at `http://localhost:2023`.
-
-## 💻 Development
-
-### Prerequisites
-
-- [Node.js](https://nodejs.org/) >= 20
-- [pnpm](https://pnpm.io/) >= 9
-
-### Setup
-
-```bash
-# Clone the repository
-git clone https://github.com/daeuniverse/daed.git
-cd daed
-
-# Install dependencies
-pnpm install
-
-# Start development server
-pnpm dev
-```
-
-### Available Scripts
-
-| Command        | Description              |
-| -------------- | ------------------------ |
-| `pnpm dev`     | Start development server |
-| `pnpm build`   | Build for production     |
-| `pnpm lint`    | Lint and fix code        |
-| `pnpm codegen` | Generate GraphQL types   |
-
-## 🤝 Contributing
-
-Contributions are welcome! Whether it's bug reports, feature requests, or pull requests — all are appreciated.
-
-Please read our [Contributing Guide](./CONTRIBUTING.md) before submitting a PR.
-
-Special thanks to all [contributors](https://github.com/daeuniverse/daed/graphs/contributors)! ❤️
-
-<a href="https://github.com/daeuniverse/daed/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=daeuniverse/daed" alt="Contributors" />
-</a>
-
-## 📄 License
-
-This project is dual licensed:
-
-- Frontend (daed): [MIT License](./LICENSE)
-- Backend (dae-wing): [AGPL-3.0 License](https://github.com/daeuniverse/dae-wing/blob/main/LICENSE)
+**step summary（run 页面 Summary 标签）里会写明具体缺什么。**
 
 ---
 
-<div align="center">
-  Made with ❤️ by <a href="https://github.com/daeuniverse">@daeuniverse</a>
-</div>
+## 3. 本 fork 的本地定制（7 处）
+
+merge 上游或 bump 时丢失任何一处，都会被指纹检查拦住。
+
+### 3.1 Header 显示内核版本
+
+`apps/web/src/components/Header.tsx`
+
+在面板 Header 显示 `内核 vX`，取自 GraphQL 的 `general.dae.version`。
+
+**为什么**：产物版本号形如 `v2.1.1-wingmain-20261014`，其中日期是**构建当天**，
+同一份代码隔天重编就变一个日期 —— 版本号完全无法反映内核是否更新。
+内核标签是唯一可靠的判据。
+
+### 3.2 端点不可达时自动回退
+
+`apps/web/src/contexts/index.tsx` + `apps/web/src/pages/Setup.tsx`
+
+面板把 endpoint 存在 localStorage。PPPoE 重连后 WAN IP 变了，
+存下来的地址就失效，导致所有请求失败。改动会在挂载时探测，
+不可达则回退到当前页面来源的地址并持久化。
+
+**为什么**：ImmortalWrt 上 PPPoE 重连是常态，手动改 endpoint 很烦。
+
+### 3.3 `coreVersion` 词条
+
+`apps/web/src/i18n/locales/{en,zh-Hans}.json`
+
+给 3.1 提供中英文文案。**两个文件都要有，JSON 不能重键。**
+
+### 3.4 `build-custom.yml`（新建）
+
+`.github/workflows/build-custom.yml`
+
+自建构建流水线。与官方 `release-please.yml` 的差异：
+
+- 显式安装 clang/llvm（官方依赖 runner 预装，eBPF 那步容易挂）
+- 前端从源码构建（带 3.1 的 UI 改动），不用官方 web.zip
+- 加了 pin 一致性断言（§2）
+
+### 3.5 `release-please.yml`（已删除）
+
+**为什么删**：fork 里 Actions 无权创建 PR，该流程必然失败：
+
+```
+GitHub Actions is not permitted to create or approve pull requests
+```
+
+已核实上游并未修复——其文件仍声明 `pull-requests: write`，无任何 fork 适配，
+提交历史里最后一次改动是构建层面的。**不要恢复它。**
+
+若上游再次改动此文件，merge 会产生 modify/delete 冲突，
+解法是 `git rm` 该文件（保持删除），不是恢复。
+
+### 3.6 75 个继承 tag（已删除）
+
+上游的 51 个 daed 版本 tag + 24 个 `dae-*` 包 tag。
+
+**为什么删**：本 fork 不发 release，这些 tag 无用；
+且 `publish-packages.yml` 只在 `dae-*-v*` tag push 时触发，
+保留它们意味着一旦误推新 tag 就会触发一个在 fork 里跑不通的 workflow。
+
+### 3.7 冗余分支（已删除）
+
+11 个分支：2 个 backup（`ahead=0`，内容已含于 main）、3 个 release-please 自动分支、
+6 个 dependabot 分支（基于 v1.24 时代代码，与 main 差 66 个提交，合并必然冲突；
+其价值已由 check-upstream 的自动 merge 覆盖）。
+
+保留：`gh-pages`（官方 Demo 站点，与 main 无共同祖先，删了就没了）。
+
+---
+
+## 4. 部署要点
+
+目标设备：ImmortalWrt x86-64（192.168.1.1，PPPoE 出网）。
+
+### 路径与官方不同
+
+| | 官方 | 本设备 |
+|---|---|---|
+| 二进制 | `/usr/local/bin/daed` | `/usr/bin/daed` |
+| geo 数据 | `/usr/share/daed/` | `/etc/daed/` |
+| 服务管理 | systemd | **procd** |
+| 配置 | `/etc/daed/` | `/etc/daed/` |
+| 日志 | journalctl | `/var/log/daed/daed.log` |
+
+**官方文档里的 `systemctl` 在本设备上不可用**，用 `/etc/init.d/daed`。
+
+### 配置在 SQLite 里，不在 .dae 文件
+
+```
+/etc/daed/wing.db    ← 全部配置（节点/分组/路由/订阅）
+/etc/daed/geoip.dat
+/etc/daed/geosite.dat
+```
+
+面板保存时把 `.dae` 语法配置存进数据库，**不落盘成 `.dae` 文件**——
+在文件系统里找不到配置文件是正常的，不是配置丢了。
+
+### 更新二进制
+
+```bash
+# 备份
+scp root@192.168.1.1:/usr/bin/daed  ~/daed.backup.$(date +%F)
+scp root@192.168.1.1:/etc/daed/wing.db ~/wing.db.backup.$(date +%F)
+
+# 替换
+ssh root@192.168.1.1 '/etc/init.d/daed stop'
+scp ./daed-linux-x86_64 root@192.168.1.1:/usr/bin/daed
+ssh root@192.168.1.1 'chmod +x /usr/bin/daed && /etc/init.d/daed start'
+```
+
+**geo 数据不要用 bundle 里的覆盖** —— 本机有 `geo-update.env` 定时更新机制。
+
+---
+
+## 5. 手动 bump（断言红了时）
+
+自动化已经处理绝大多数情况，只有红灯时才需要手动介入。
+
+```bash
+# 1. 取 dae main 最新 sha
+gh api repos/daeuniverse/dae/commits/main --jq '.sha'
+
+# 2. 确认 wing 依赖的 API 还在（bump 的前提条件）
+gh api repos/daeuniverse/dae/contents/config/marshal.go --jq '.content' \
+  | base64 -d | grep -E 'func \(m \*Marshaller\) Bytes\(\)'
+
+# 3. 改 .github/workflows/build-custom.yml 里那行 DAECORE=<新 sha>
+
+# 4. 推送，触发构建
+git commit -am "build(deps): bump dae-core to <短sha>"
+git push
+```
+
+bump wing 同理，改 submodule 指针：
+
+```bash
+git -C wing fetch origin main
+git -C wing checkout <新 sha>
+git add wing && git commit -m "build(deps): bump wing" && git push
+```
+
+---
+
+## 6. 人工解 merge 冲突
+
+只在「上游改到了本 fork 定制过的文件」时发生。
+
+```bash
+git remote add upstream https://github.com/daeuniverse/daed.git
+git fetch upstream
+git checkout main
+git merge upstream/main
+```
+
+冲突文件与解法：
+
+| 文件 | 解法 |
+|---|---|
+| `.github/workflows/release-please.yml` | `git rm`（保持删除，见 §3.5） |
+| `README.md` | 保留本 fork 版本，见 §3 |
+| `apps/web/src/components/Header.tsx` | 保留 `general.dae.version` 那段 |
+| `apps/web/src/contexts/index.tsx` | 保留端点回退逻辑 |
+| `apps/web/src/pages/Setup.tsx` | 保留 `useEffect` 回退块 |
+| `apps/web/src/i18n/locales/*.json` | 两个 `coreVersion` 都保留 |
+
+解完跑一遍指纹校验（见 §7）确认 7 处定制都在，再 push。
+
+---
+
+## 7. 验证命令
+
+```bash
+# 三层指针
+echo "wing    : $(gh api 'repos/szwjp/daed/contents/wing?ref=main' --jq '.sha[0:8]')"
+echo "DAECORE : $(gh api 'repos/szwjp/daed/contents/.github/workflows/build-custom.yml?ref=main' --jq '.content' | base64 -d | sed -nE 's/^[[:space:]]*DAECORE=([0-9a-f]{40}).*/\1/p' | cut -c1-8)"
+gh api repos/daeuniverse/dae/commits/main      --jq '"dae      : \(.sha[0:8])"'
+gh api repos/daeuniverse/dae-wing/commits/main --jq '"dae-wing : \(.sha[0:8])"'
+
+# 7 处定制指纹
+cd <repo>
+for f in "general.dae.version:apps/web/src/components/Header.tsx" \
+         "coreVersion:apps/web/src/i18n/locales/zh-Hans.json" \
+         "coreVersion:apps/web/src/i18n/locales/en.json" \
+         "DEFAULT_ENDPOINT_URL:apps/web/src/contexts/index.tsx" \
+         "endpoint unreachable:apps/web/src/pages/Setup.tsx" \
+         "Assert dae-core pin:.github/workflows/build-custom.yml"; do
+  k="${f%%:*}"; p="${f##*:}"
+  grep -q "$k" "$p" && echo "✓ $p" || echo "✗ $p 缺失"
+done
+[ -f .github/workflows/release-please.yml ] && echo "✗ release-please.yml 被恢复" || echo "✓ release-please.yml 保持删除"
+
+# 最近构建
+gh run list --repo szwjp/daed --limit 5
+```
+
+---
+
+## 8. 已知的坑
+
+**版本号会骗人。** 产物 tag 是 `v2.1.1-wingmain-YYYYMMDD`，日期是构建当天算的，
+与代码版本无关。**判断内核是否更新，只看面板 Header 的 `内核 vX` 标签。**
+
+**`behind_by` 计数不可信。** GitHub 在 fork 的 merge-base 上会把历史分叉算进去，
+可能显示 `behind=11` 而 `total_commits=0`（即上游没有任何你缺的提交）。
+以 `total_commits` 和实际 commit 是否存在为准。
+
+**`make deps` 不校验版本。** 它的判据是 `dae-core/control/bpf_bpfeb.o` 是否存在，
+pin 错了照样能编出二进制、照样能起面板，只有内核代码是旧的。
+这就是为什么需要 §2 的断言。
+
+**BSD sed 不支持反向引用。** 改 workflow 时别用 `sed 's|\(x\)|\1|'` 形式，
+macOS 本地会报 `\1 not defined in the RE`（GitHub runner 是 Linux 不受影响）。
+
+**Actions 里用 `gh` 要设 `GH_TOKEN`。** 否则以 exit 4 退出，
+这个坑在本地测不出来（本地 gh 已认证）。
+
+---
+
+## 9. 相关链接
+
+- 上游 daed：https://github.com/daeuniverse/daed
+- 上游 dae-wing：https://github.com/daeuniverse/dae-wing
+- 上游 dae：https://github.com/daeuniverse/dae
+- 社区 OpenWrt 打包方案（提供 vmlinux-btf 与 5 个 DNS/eBPF 补丁）：https://github.com/QiuSimons/luci-app-daed
+- dae 内核原理：https://github.com/daeuniverse/dae/blob/main/docs/zh/user-guide
+
+---
+
+## License
+
+上游 daed 为 AGPL-3.0 + MIT。本 fork 未改动任何许可证文件。
