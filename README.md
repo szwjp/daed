@@ -43,7 +43,7 @@ daed (React 前端)              ← 本 fork main
 |---|---|---|
 | bump dae-core 前 | `Marshaller.Bytes()` 存在 | 上游重构了 wing 依赖的 API |
 | bump wing 后 | 3 个 dae 导出符号存在 | 新版 wing 要的 API 当前 pin 没有 |
-| push 前 | 7 处本地定制指纹 | merge 覆盖了定制内容 |
+| push 前 | 6 处本地定制指纹 | merge 覆盖了定制内容 |
 | push 后 | `Assert dae-core pin matches dae main` | pin 与 dae main 不一致 |
 
 ### 红灯含义
@@ -59,7 +59,7 @@ daed (React 前端)              ← 本 fork main
 
 ---
 
-## 3. 本 fork 的本地定制（7 处）
+## 3. 本 fork 的本地定制（6 处）
 
 merge 上游或 bump 时丢失任何一处，都会被指纹检查拦住。
 
@@ -112,24 +112,6 @@ GitHub Actions is not permitted to create or approve pull requests
 
 若上游再次改动此文件，merge 会产生 modify/delete 冲突，
 解法是 `git rm` 该文件（保持删除），不是恢复。
-
-### 3.6 75 个继承 tag（已删除）
-
-上游的 51 个 daed 版本 tag + 24 个 `dae-*` 包 tag。
-
-**为什么删**：本 fork 不发 release，这些 tag 无用；
-且 `publish-packages.yml` 只在 `dae-*-v*` tag push 时触发，
-保留它们意味着一旦误推新 tag 就会触发一个在 fork 里跑不通的 workflow。
-
-### 3.7 冗余分支（已删除）
-
-11 个分支：2 个 backup（`ahead=0`，内容已含于 main）、3 个 release-please 自动分支、
-6 个 dependabot 分支（基于 v1.24 时代代码，与 main 差 66 个提交，合并必然冲突；
-其价值已由 check-upstream 的自动 merge 覆盖）。
-
-保留：`gh-pages`（官方 Demo 站点，与 main 无共同祖先，删了就没了）。
-
----
 
 ## 4. 部署要点
 
@@ -226,7 +208,7 @@ git merge upstream/main
 | `apps/web/src/pages/Setup.tsx` | 保留 `useEffect` 回退块 |
 | `apps/web/src/i18n/locales/*.json` | 两个 `coreVersion` 都保留 |
 
-解完跑一遍指纹校验（见 §7）确认 7 处定制都在，再 push。
+解完跑一遍指纹校验（见 §7）确认 6 处定制都在，再 push。
 
 ---
 
@@ -239,13 +221,14 @@ echo "DAECORE : $(gh api 'repos/szwjp/daed/contents/.github/workflows/build-cust
 gh api repos/daeuniverse/dae/commits/main      --jq '"dae      : \(.sha[0:8])"'
 gh api repos/daeuniverse/dae-wing/commits/main --jq '"dae-wing : \(.sha[0:8])"'
 
-# 7 处定制指纹
+# 6 处定制指纹
 cd <repo>
 for f in "general.dae.version:apps/web/src/components/Header.tsx" \
          "coreVersion:apps/web/src/i18n/locales/zh-Hans.json" \
          "coreVersion:apps/web/src/i18n/locales/en.json" \
          "DEFAULT_ENDPOINT_URL:apps/web/src/contexts/index.tsx" \
          "endpoint unreachable:apps/web/src/pages/Setup.tsx" \
+         "szwjp/daed:README.md" \
          "Assert dae-core pin:.github/workflows/build-custom.yml"; do
   k="${f%%:*}"; p="${f##*:}"
   grep -q "$k" "$p" && echo "✓ $p" || echo "✗ $p 缺失"
