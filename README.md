@@ -241,28 +241,7 @@ gh run list --repo szwjp/daed --limit 5
 
 ---
 
-## 8. 已知的坑
-
-**版本号会骗人。** 产物 tag 是 `v2.1.1-wingmain-YYYYMMDD`，日期是构建当天算的，
-与代码版本无关。**判断内核是否更新，只看面板 Header 的 `内核 vX` 标签。**
-
-**`behind_by` 计数不可信。** GitHub 在 fork 的 merge-base 上会把历史分叉算进去，
-可能显示 `behind=11` 而 `total_commits=0`（即上游没有任何你缺的提交）。
-以 `total_commits` 和实际 commit 是否存在为准。
-
-**`make deps` 不校验版本。** 它的判据是 `dae-core/control/bpf_bpfeb.o` 是否存在，
-pin 错了照样能编出二进制、照样能起面板，只有内核代码是旧的。
-这就是为什么需要 §2 的断言。
-
-**BSD sed 不支持反向引用。** 改 workflow 时别用 `sed 's|\(x\)|\1|'` 形式，
-macOS 本地会报 `\1 not defined in the RE`（GitHub runner 是 Linux 不受影响）。
-
-**Actions 里用 `gh` 要设 `GH_TOKEN`。** 否则以 exit 4 退出，
-这个坑在本地测不出来（本地 gh 已认证）。
-
----
-
-## 9. 相关链接
+## 8. 相关链接
 
 - 上游 daed：https://github.com/daeuniverse/daed
 - 上游 dae-wing：https://github.com/daeuniverse/dae-wing
