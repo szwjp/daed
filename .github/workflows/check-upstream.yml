@@ -1,0 +1,277 @@
+name: Check Upstream
+
+# 借鉴 QiuSimons/luci-app-daed 的 autoupdate.yml 骨架（定时查三个上游、发现更新就处理），
+# 但有三处刻意不同，见下方"与上游做法的差异"。
+#
+# 本文件只负责"把指针推到该去的位置"，最终把关交给 build-custom.yml 里
+# 那道 `Assert dae-core pin matches dae main` 断言——它在 push 后自动触发。
+#
+# 操作手册：见桌面的 daed-build-manual.md（bump 异常时看 §4 / §7）
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * *"   # 每天 UTC 00:00 = 北京时间 08:00
+
+permissions:
+  contents: write
+
+concurrency:
+  group: check-upstream
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      need_dae: ${{ steps.probe.outputs.need_dae }}
+      need_wing: ${{ steps.probe.outputs.need_wing }}
+      need_daed: ${{ steps.probe.outputs.need_daed }}
+      dae_new: ${{ steps.probe.outputs.dae_new }}
+      wing_new: ${{ steps.probe.outputs.wing_new }}
+      dae_commits: ${{ steps.probe.outputs.dae_commits }}
+      wing_commits: ${{ steps.probe.outputs.wing_commits }}
+      custom_check: ${{ steps.probe.outputs.custom_check }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Probe upstream
+        id: probe
+        run: |
+          set -euo pipefail
+          gh api repos/daeuniverse/dae/commits/main      --jq '.sha' > /tmp/dae.sha
+          gh api repos/daeuniverse/dae-wing/commits/main --jq '.sha' > /tmp/wing.sha
+          gh api repos/daeuniverse/daed/commits/main     --jq '.sha' > /tmp/daed.sha
+
+          DAE_NEW="$(cat /tmp/dae.sha)"
+          WING_NEW="$(cat /tmp/wing.sha)"
+          DAED_NEW="$(cat /tmp/daed.sha)"
+
+          # 本地 pin 值。DAECORE 从 workflow 里读，不用行号，按变量名匹配。
+          DAE_OLD="$(sed -nE 's/^[[:space:]]*DAECORE=([0-9a-f]{40}).*/\1/p' .github/workflows/build-custom.yml | head -1)"
+          WING_OLD="$(git -C wing rev-parse HEAD)"
+          DAED_OLD="$(git rev-parse HEAD)"
+
+          echo "dae   : $DAE_OLD -> $DAE_NEW"
+          echo "wing  : ${WING_OLD:0:8} -> ${WING_NEW:0:8}"
+          echo "daed  : ${DAED_OLD:0:8} -> ${DAED_NEW:0:8}"
+
+          [ -n "$DAE_OLD" ] || { echo "::error::未能从 build-custom.yml 解析出 DAECORE"; exit 1; }
+
+          need_dae=false;  [ "$DAE_OLD"  = "$DAE_NEW"  ] || need_dae=true
+          need_wing=false; [ "$WING_OLD" = "$WING_NEW" ] || need_wing=true
+          need_daed=false; [ "$DAED_OLD" = "$DAED_NEW" ] || need_daed=true
+
+          # 落后多少个 commit（用于写进提交信息和 step summary）
+          dae_commits=0
+          if [ "$need_dae" = true ]; then
+            git fetch -q https://github.com/daeuniverse/dae.git main
+            dae_commits="$(git rev-list --count "$DAE_OLD..$DAE_NEW" 2>/dev/null || echo '?')"
+          fi
+          wing_commits=0
+          if [ "$need_wing" = true ]; then
+            git -C wing fetch -q origin main
+            wing_commits="$(git -C wing rev-list --count "$WING_OLD..$WING_NEW" 2>/dev/null || echo '?')"
+          fi
+
+          # 自有改动指纹：merge 上游 daed 后必须还在，否则说明被覆盖了
+          custom_check=ok
+          if ! grep -q 'general.dae.version' apps/web/src/components/Header.tsx \
+             || ! grep -q 'coreVersion' apps/web/src/i18n/locales/zh-Hans.json \
+             || ! grep -q 'DEFAULT_ENDPOINT_URL' apps/web/src/contexts/index.tsx \
+             || ! grep -q 'Assert dae-core pin matches dae main' .github/workflows/build-custom.yml; then
+            custom_check=missing
+          fi
+
+          {
+            echo "need_dae=$need_dae"
+            echo "need_wing=$need_wing"
+            echo "need_daed=$need_daed"
+            echo "dae_new=$DAE_NEW"
+            echo "wing_new=$WING_NEW"
+            echo "dae_commits=$dae_commits"
+            echo "wing_commits=$wing_commits"
+            echo "custom_check=$custom_check"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## 上游检查"
+            echo ""
+            echo "| 层 | 本地 | 上游 | 需要更新 |"
+            echo "|---|---|---|---|"
+            echo "| dae-core | ${DAE_OLD:0:8} | ${DAE_NEW:0:8} | $need_dae |"
+            echo "| dae-wing | ${WING_OLD:0:8} | ${WING_NEW:0:8} | $need_wing |"
+            echo "| daed | ${DAED_OLD:0:8} | ${DAED_NEW:0:8} | $need_daed |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$need_dae$need_wing$need_daed" = "falsefalsefalse" ]; then
+            echo "全部已同步，无需处理。"
+          fi
+
+  bump:
+    needs: check
+    if: needs.check.outputs.need_dae == 'true' || needs.check.outputs.need_wing == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      # 与上游做法的差异 ①：bump 前验证 wing 依赖的 dae API 还在。
+      # QiuSimons 直接把 CORE 设成 main tip，不做这个检查，API 消失后要到
+      # 编译失败才发现。这里提前挡住，并把原因写清楚。
+      - name: Safety check - wing 依赖的 dae API 仍然存在
+        if: needs.check.outputs.need_dae == 'true'
+        run: |
+          set -euo pipefail
+          NEW="${{ needs.check.outputs.dae_new }}"
+          if gh api "repos/daeuniverse/dae/contents/config/marshal.go?ref=$NEW" --jq '.content' 2>/dev/null \
+               | base64 -d 2>/dev/null \
+               | grep -qE 'func \(m \*Marshaller\) Bytes\(\)'; then
+            echo "::notice::Marshaller.Bytes 在 $NEW 中存在，可以安全 bump"
+            exit 0
+          fi
+          {
+            echo "## ⛔ 未 bump：dae API 已变"
+            echo ""
+            echo "\`Marshaller.Bytes()\`（\`config/marshal.go\`）在 dae \`$NEW\` 中不存在或已重构。"
+            echo "wing main 依赖该方法，自动 bump 会导致构建失败。"
+            echo ""
+            echo "需要人工介入，按操作手册 §4.1 处理。"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=dae API 变更，放弃自动 bump::Marshaller.Bytes 已消失，需人工确认"
+          exit 1
+
+      # 与上游做法的差异 ②：按变量名替换，不用 sed 行号。
+      # 上游用 sed -i "7 a PKG_VERSION:=..." 硬编码行号，Makefile 一改行数就静默插错位置。
+      - name: Bump dae-core pin
+        if: needs.check.outputs.need_dae == 'true'
+        run: |
+          set -euo pipefail
+          NEW="${{ needs.check.outputs.dae_new }}"
+          # 按变量名替换整行，不依赖行号；不用 sed 反向引用（BSD sed 不支持 \1）
+          sed -i -E "s|^[[:space:]]*DAECORE=.*|          DAECORE=$NEW|" .github/workflows/build-custom.yml
+          # 回读校验，不一致就停——绝不推一个改坏的 workflow
+          grep -qE "^[[:space:]]*DAECORE=$NEW$" .github/workflows/build-custom.yml \
+            || { echo "::error::DAECORE 替换后回读不一致"; exit 1; }
+          echo "DAECORE -> $NEW"
+
+      # 与上游做法的差异 ③：submodule 指针用 git 命令改，不用 sed。
+      # 指针是 git 对象不是文本，改错会得到一个损坏的 submodule。
+      - name: Bump dae-wing submodule
+        if: needs.check.outputs.need_wing == 'true'
+        run: |
+          set -euo pipefail
+          NEW="${{ needs.check.outputs.wing_new }}"
+          git -C wing fetch -q origin "$NEW"
+          git -C wing checkout -q "$NEW"
+          git -C wing submodule update --init --recursive
+          [ "$(git -C wing rev-parse HEAD)" = "$NEW" ] \
+            || { echo "::error::wing 指针回读不一致"; exit 1; }
+          echo "wing -> $NEW"
+
+      - name: Verify custom changes intact
+        run: |
+          set -euo pipefail
+          if [ "${{ needs.check.outputs.custom_check }}" != "ok" ]; then
+            echo "::error::自有改动指纹缺失，放弃推送"; exit 1
+          fi
+          echo "自有改动指纹完整"
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          git config user.name szwjp
+          git config user.email szwjp@users.noreply.github.com
+          git add -A
+
+          MSG="bump: 自动同步上游"
+          if [ "${{ needs.check.outputs.need_dae }}" = true ]; then
+            MSG="${MSG}"$'\n'"- dae-core -> ${{ needs.check.outputs.dae_new }}（落后 ${{ needs.check.outputs.dae_commits }} 个 commit）"
+          fi
+          if [ "${{ needs.check.outputs.need_wing }}" = true ]; then
+            MSG="${MSG}"$'\n'"- dae-wing -> ${{ needs.check.outputs.wing_new }}（落后 ${{ needs.check.outputs.wing_commits }} 个 commit）"
+          fi
+          MSG="${MSG}"$'\n\n'"wing 依赖检查: Marshaller.Bytes 存在 ✓"$'\n'"最终把关: build-custom.yml 的断言会在本次 push 后自动触发"$'\n'"若断言转红，按操作手册 §4.1 处理"
+
+          git commit -q -m "$MSG"
+          git push origin HEAD:main
+          echo "已推送到 main"
+
+  # daed 层（前端）单独一个 job：它要 merge 上游，有冲突可能，策略完全不同。
+  # 本 fork 相对上游是 diverged（ahead 2 / behind 7），必然撞 6 处自有改动，
+  # 所以这里只做「干净才自动」——撞冲突就停下来，绝不猜着解决。
+  sync-daed:
+    needs: check
+    if: needs.check.outputs.need_daed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Merge upstream daed
+        run: |
+          set -uo pipefail
+          git remote add upstream https://github.com/daeuniverse/daed.git 2>/dev/null || true
+          git fetch -q upstream main
+
+          if git merge --no-edit upstream/main; then
+            echo "::notice::merge 干净，可自动推进"
+            echo "MERGE_CLEAN=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          CONFLICTS="$(git diff --name-only --diff-filter=U | tr '\n' ' ')"
+          echo "merge 冲突: $CONFLICTS"
+          {
+            echo "## ⛔ daed 上游有更新，但 merge 有冲突"
+            echo ""
+            echo "冲突文件: \`$CONFLICTS\`"
+            echo ""
+            echo "本 fork 相对上游是 **diverged**（既有自有改动，又落后上游提交），"
+            echo "合并必然与下列自有改动冲突，**已放弃自动合并**，仓库保持原状。"
+            echo ""
+            echo "需要人工处理，按操作手册 §5「同步上游 daed」的流程走。"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=daed merge 冲突::需人工处理，见操作手册 §5"
+          echo "MERGE_CLEAN=false" >> "$GITHUB_ENV"
+          # 不 exit 1：让后续步骤有机会把冲突信息整理好，job 状态由最后一步决定
+
+      - name: Verify custom changes survived merge
+        if: env.MERGE_CLEAN == 'true'
+        run: |
+          set -euo pipefail
+          MISSING=""
+          grep -q 'general.dae.version'  apps/web/src/components/Header.tsx              || MISSING="$MISSING Header.tsx(coreVersion)"
+          grep -q 'coreVersion'            apps/web/src/i18n/locales/zh-Hans.json         || MISSING="$MISSING zh-Hans.json"
+          grep -q 'coreVersion'            apps/web/src/i18n/locales/en.json              || MISSING="$MISSING en.json"
+          grep -q 'DEFAULT_ENDPOINT_URL'   apps/web/src/contexts/index.tsx                || MISSING="$MISSING contexts/index.tsx"
+          grep -q 'endpoint unreachable'    apps/web/src/pages/Setup.tsx                  || MISSING="$MISSING Setup.tsx"
+          grep -q 'Assert dae-core pin'    .github/workflows/build-custom.yml            || MISSING="$MISSING build-custom.yml"
+          [ -f .github/workflows/release-please.yml ] && MISSING="$MISSING release-please.yml(被恢复)"
+
+          if [ -n "$MISSING" ]; then
+            echo "::error::merge 后自有改动丢失:$MISSING"
+            exit 1
+          fi
+          echo "merge 后 6 处自有改动全部完好"
+
+      - name: Push merged daed
+        if: env.MERGE_CLEAN == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name szwjp
+          git config user.email szwjp@users.noreply.github.com
+          git add -A
+          git commit -q -m "merge: 同步上游 daed（自动，merge 干净）" || {
+            echo "::notice::无可提交变更"; exit 0; }
+          git push origin HEAD:main
