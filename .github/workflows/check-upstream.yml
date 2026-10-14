@@ -222,33 +222,63 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
+      # git identity 必须先设好，否则 merge 会因 empty ident 直接失败
+      - name: Configure git identity
+        run: |
+          git config user.name szwjp
+          git config user.email szwjp@users.noreply.github.com
+          git config --get user.email
+
       - name: Merge upstream daed
         run: |
           set -uo pipefail
           git remote add upstream https://github.com/daeuniverse/daed.git 2>/dev/null || true
-          git fetch -q upstream main
+          if ! git fetch -q upstream main; then
+            echo "::error::fetch upstream/main 失败"
+            exit 1
+          fi
 
-          if git merge --no-edit upstream/main; then
+          git merge --no-edit upstream/main
+          RC=$?
+
+          if [ $RC -eq 0 ]; then
             echo "::notice::merge 干净，可自动推进"
             echo "MERGE_CLEAN=true" >> "$GITHUB_ENV"
             exit 0
           fi
 
-          CONFLICTS="$(git diff --name-only --diff-filter=U | tr '\n' ' ')"
-          echo "merge 冲突: $CONFLICTS"
-          {
-            echo "## ⛔ daed 上游有更新，但 merge 有冲突"
-            echo ""
-            echo "冲突文件: \`$CONFLICTS\`"
-            echo ""
-            echo "本 fork 相对上游是 **diverged**（既有自有改动，又落后上游提交），"
-            echo "合并必然与下列自有改动冲突，**已放弃自动合并**，仓库保持原状。"
-            echo ""
-            echo "需要人工处理，按操作手册 §5「同步上游 daed」的流程走。"
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "::error title=daed merge 冲突::需人工处理，见操作手册 §5"
+          # 区分「真冲突」和「命令本身失败」——两者都要停下来，但提示不能一样
+          CONFLICTS="$(git diff --name-only --diff-filter=U | tr '\n' ' ' | sed 's/ $//')"
+
+          if [ -n "$CONFLICTS" ]; then
+            echo "merge 冲突: $CONFLICTS"
+            {
+              echo "## ⛔ daed 上游有更新，但 merge 有冲突"
+              echo ""
+              echo "冲突文件: \`$CONFLICTS\`"
+              echo ""
+              echo "本 fork 相对上游是 **diverged**（既有自有改动，又落后上游提交），"
+              echo "**已放弃自动合并**，仓库保持原状。"
+              echo ""
+              echo "需要人工处理，按操作手册 §5「同步上游 daed」的流程走。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=daed merge 冲突::需人工处理，见操作手册 §5"
+          else
+            echo "::warning::merge 返回 $RC 但无冲突文件，说明是命令本身失败，不是内容冲突"
+            git merge --abort 2>/dev/null || true
+            {
+              echo "## ⛔ daed merge 命令失败（非内容冲突）"
+              echo ""
+              echo "\`git merge\` 退出码 $RC，且冲突文件列表为空——这不是内容冲突，"
+              echo "而是命令执行本身出错（例如 git identity 未配置、磁盘问题）。"
+              echo ""
+              echo "仓库保持原状。请看该步骤日志定位。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=daed merge 命令失败::非内容冲突，见步骤日志"
+          fi
+
           echo "MERGE_CLEAN=false" >> "$GITHUB_ENV"
-          # 不 exit 1：让后续步骤有机会把冲突信息整理好，job 状态由最后一步决定
+          exit 1
 
       - name: Verify custom changes survived merge
         if: env.MERGE_CLEAN == 'true'
