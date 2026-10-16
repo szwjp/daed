@@ -165,12 +165,16 @@ jobs:
   # 产物分发：把 bundle 打成 tar.gz 上传 GitHub Release，OpenWrt 包从 release 拉。
   # 触发：push 触发且 build 跑通；commit message 含 [skip release] 时跳过。
   # 重复发布同一日 release 时先删旧的；tag 形如 v2.1.1-nightly-20261016。
+  #
+  # 防御性 if：push 的 before/after 字段在 re-run 场景可能为 null，
+  # 这里只依赖 event_name + commit message，避免 fork-sync 等场景被错杀。
   release:
     needs: build
-    if: >
+    if: >-
       success() &&
       github.event_name == 'push' &&
-      !contains(github.event.head_commit.message, '[skip release]')
+      (github.event.head_commit.message == null ||
+       !contains(toLower(github.event.head_commit.message), '[skip release]'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
