@@ -172,7 +172,7 @@ jobs:
     needs: build
     if: >-
       success() &&
-      github.event_name == 'push' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       (github.event.head_commit.message == null ||
        !contains(github.event.head_commit.message, '[skip release]'))
     runs-on: ubuntu-latest
