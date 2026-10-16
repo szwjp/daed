@@ -180,6 +180,13 @@ jobs:
     permissions:
       contents: write
     steps:
+      # release job 拉 pin 文件的最小 checkout（sparse 模式，只取 dae-core.pin）。
+      # 不取整个仓库是为了避免污染 release job 工作区。
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          sparse-checkout: dae-core.pin
+
       - uses: actions/download-artifact@v7
         with:
           name: daed-linux-x86_64-bundle
