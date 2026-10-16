@@ -167,14 +167,14 @@ jobs:
   # 重复发布同一日 release 时先删旧的；tag 形如 v2.1.1-nightly-20261016。
   #
   # 防御性 if：push 的 before/after 字段在 re-run 场景可能为 null，
-  # 这里只依赖 event_name + commit message，避免 fork-sync 等场景被错杀。
+  # 这里只依赖 event_name + commit message（注意 GH 表达式没有 toLower，skip token 写全小写）。
   release:
     needs: build
     if: >-
       success() &&
       github.event_name == 'push' &&
       (github.event.head_commit.message == null ||
-       !contains(toLower(github.event.head_commit.message), '[skip release]'))
+       !contains(github.event.head_commit.message, '[skip release]'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
