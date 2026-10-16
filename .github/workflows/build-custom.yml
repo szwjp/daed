@@ -211,22 +211,44 @@ jobs:
           # 上传到 runner 的固定路径，方便 create release 时 attach
           echo "ASSET_PATH=$(pwd -W 2>/dev/null || pwd)/daed-linux-x86_64.tar.gz" >> "$GITHUB_ENV"
 
-      - name: Compute tag and notes
+      - name: Compute tag
         id: meta
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           DATE="$(date -u +%Y%m%d)"
           TAG="v2.1.1-nightly-${DATE}"
-          VERSION_DATE="$(date -u +%Y.%m.%d)"
-          COMPARED="$(gh api repos/szwjp/daed/compare/${{ github.event.before }}...${{ github.sha }} --jq '.commits | length' 2>/dev/null || echo 0)"
-          NOTES="$(cat <<EOF
-          # szwjp/daed nightly ${VERSION_DATE}
+
+          # 同一日重发：先删旧 tag。失败不致命（首次跑就没有）。
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::notice::release $TAG 已存在，先删除再重发"
+            gh release delete "$TAG" --yes
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          # 比较上次 build 以来多了多少 commit：before/after 字段在 re-run 时可能为 null，
+          # 此时显示 "?"，不阻塞发布。
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.sha }}"
+          if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            COMPARED="$(gh api "repos/szwjp/daed/compare/${BEFORE}...${AFTER}" --jq '.commits | length' 2>/dev/null || echo '?')"
+          else
+            COMPARED="?"
+          fi
+          echo "compared=$COMPARED" >> "$GITHUB_OUTPUT"
+
+      - name: Write release notes file
+        env:
+          DAECORE_PIN: ${{ env.DAECORE_PIN }}
+        run: |
+          cat > release-notes.md <<EOF
+          # szwjp/daed nightly $(date -u +%Y.%m.%d)
 
           - commit: \`${{ github.sha }}\`
           - dae-core pin: \`${DAECORE_PIN}\`
           - wing: pinned in submodule
-          - this run: ${COMPARED} commit(s) since previous build
+          - this run: ${{ steps.meta.outputs.compared }} commit(s) since previous build
 
           ## What this is
           daed (web UI) bundled with dae + dae-wing, built from szwjp/daed@main.
@@ -237,18 +259,7 @@ jobs:
 
           Built by the \`build-custom\` workflow.
           EOF
-          )"
-          # 同一日重发：先删旧 tag
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "::notice::release $TAG 已存在，先删除再重发"
-            gh release delete "$TAG" --yes
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          {
-            echo "NOTES<<EOF"
-            echo "$NOTES"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          cat release-notes.md
 
       - name: Create release
         env:
@@ -256,6 +267,6 @@ jobs:
         run: |
           gh release create "${{ steps.meta.outputs.tag }}" \
             --title "szwjp/daed nightly $(date -u +%Y.%m.%d)" \
-            --notes "${{ steps.meta.outputs.NOTES }}" \
+            --notes-file release-notes.md \
             --target "${{ github.sha }}" \
-            "$ASSET_PATH#daed-linux-x86_64.tar.gz"
+            daed-linux-x86_64.tar.gz
