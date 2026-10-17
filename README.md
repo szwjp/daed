@@ -84,6 +84,17 @@ hash 指向已删除的资产；而只编码 fork commit 时，同一天对同�
 失败时（任一 job 红）会自动开一个 issue 记录 run 链接；已有同名 open issue 时只追加评论。
 step summary（run 页面 Summary 标签）里也会写明具体缺什么。
 
+### 2.4 保活、自检与熔断
+
+无人值守最怕「静默停摆」，这三项是为此加的：
+
+| 机制 | 行为 | 为什么 |
+|---|---|---|
+| 保活 | 每轮 check-upstream 检查 HEAD 提交时间，超过 **25 天**没有提交就自动提交 `.github/keepalive` 并推送 | 公开仓库 60 天无活动会被 GitHub 禁用 schedule；daed/dae-wing 已归档、dae 常几周不动，靠人工提交不可靠 |
+| 自检 | 每轮检查对端 `szwjp/luci-app-daed` 的 `release-sync`：workflow `state` 必须 `active`，最近一次 `schedule` 运行不超过 **30 小时**；异常则开 issue（12h 去重）。luci 侧反向检查 daed | 任一仓的 schedule 被禁用都能被另一仓发现 |
+| 熔断 | dispatch 前统计 `build-custom` 最近连续失败次数，**≥3** 时暂停自动重试并打 warning | 上游永久不兼容时不至于每天无限重试；修复后手动 dispatch 或 push 一次，成功即复位 |
+| 恢复收尾 | 一轮成功（skipped 不算失败）后自动关闭同名失败 issue | 不需要人工关 issue，熔断状态也随之复位 |
+
 **关于定时触发**：schedule 依赖 GitHub 的定时器——fork 里的 scheduled workflow 需要手动启用，
 且公开仓库 60 天无仓库活动会被自动禁用。发现定时不再自动跑时，去 Actions 页面重新启用即可。
 （本 fork 的 build-custom 成功后会提交 dae-core.pin，属于仓库活动，有助于保活。）
