@@ -253,7 +253,8 @@ jobs:
             -C bundled daed-linux-x86_64 daed.service daed.desktop icons \
             geoip.dat geosite.dat
           sha256sum daed-linux-x86_64.tar.gz | awk '{print $1}' > daed-linux-x86_64.tar.gz.sha256
-          tar -tvzf daed-linux-x86_64.tar.gz | head -3
+          # 不要 | head：pipefail 下 head 提前关闭管道会让 tar 以 SIGPIPE 退出 2。
+          tar -tvzf daed-linux-x86_64.tar.gz | sed -n '1,3p'
           ls -la daed-linux-x86_64.tar.gz
           cat daed-linux-x86_64.tar.gz.sha256
 
