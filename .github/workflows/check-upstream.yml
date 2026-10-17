@@ -1,16 +1,18 @@
 name: Check Upstream
 
 # 借鉴 QiuSimons/luci-app-daed 的 autoupdate.yml 骨架（定时查三个上游、发现更新就处理），
-# 但有四处刻意不同，见各步骤上方的 ① ② ③ ④ 注释：
-#   ① bump dae-core 前校验 wing 依赖的 dae API 仍在（上游不做这个检查）
+# 但有几处刻意不同，见各步骤上方的注释：
+#   ① dae-core 不在这里直接改 pin：只做「候选 sha 的符号快速检查」，
+#      把 sha 交给 build-custom.yml 编译验证；编译通过并发 release 后，
+#      由 build-custom 的 pin-dae-core job 提交 dae-core.pin。
+#      → pin 永远指向真实构建通过的 sha，失败时 pin 不动、下一轮自动重试。
 #   ② dae-core pin 存普通文件 dae-core.pin，不动 .github/workflows/
 #      （GITHUB_TOKEN 没有 workflows 权限，改 workflow 文件的 push 会被服务端拒绝）
 #   ③ submodule 指针用 git 命令改，不用 sed 改文本
 #   ④ bump wing 后校验 wing 依赖的 dae 导出符号在当前 pin 中仍存在
 #
-# 本文件只负责"把指针推到该去的位置"，最终把关交给 build-custom.yml 里
-# 那道 `Assert dae-core pin matches dae main` 断言——它由本文件在 push 后显式触发
-# （GITHUB_TOKEN 的 push 事件不会创建新的 workflow run）。
+# 2026-10-17 上游变化：daeuniverse/daed 与 dae-wing 均已 archived（只有 dae 还在演进），
+# 因此本文件的 dae-core 层是唯一会日常动作的部分；daed/wing 两层保留但没有新提交可同步。
 #
 # 操作手册：README.md §5（手动 bump）/ §6（人工解 merge 冲突）/ §7（验证命令）
 #
@@ -20,7 +22,7 @@ name: Check Upstream
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * *"   # 每天 UTC 00:00 = 北京时间 08:00
+    - cron: "0 */6 * * *"   # 每 6 小时（UTC 00/06/12/18）；上游有变化才真正构建，成本可忽略
 
 permissions:
   contents: write
@@ -141,7 +143,9 @@ jobs:
 
   bump:
     needs: check
-    if: needs.check.outputs.need_dae == 'true' || needs.check.outputs.need_wing == 'true'
+    # 只处理 dae-wing 的指针。dae-core 不再在这里直接改 pin——
+    # 它必须等 build-custom 编译通过、release 发成功后才由那边提交，见 advance-dae-core。
+    if: needs.check.outputs.need_wing == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -155,56 +159,7 @@ jobs:
           submodules: recursive
           token: ${{ secrets.SYNC_TOKEN || github.token }}
 
-      # 与上游做法的差异 ①：bump 前验证 wing 依赖的 dae API 还在。
-      # QiuSimons 直接把 CORE 设成 main tip，不做这个检查，API 消失后要到
-      # 编译失败才发现。这里提前挡住，并把原因写清楚。
-      - name: Safety check - wing 依赖的 dae API 仍然存在
-        if: needs.check.outputs.need_dae == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          NEW="${{ needs.check.outputs.dae_new }}"
-          [[ "$NEW" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::dae_new 不是合法 sha: '$NEW'"; exit 1; }
-
-          # 先区分「读不到」和「读到了但符号不在」：404/网络/限流不能当成 API 变更，
-          # 否则会误报「上游重构了 API」并要求人工介入。
-          if ! gh api "repos/daeuniverse/dae/contents/config/marshal.go?ref=$NEW" --jq '.content' > /tmp/marshal.b64; then
-            echo "::error title=读取上游失败::marshal.go@$NEW 读取失败（404/网络/限流），无法判断，本次不 bump，请重跑"
-            exit 1
-          fi
-          if base64 -d /tmp/marshal.b64 | grep -qE 'func \(m \*Marshaller\) Bytes\(\)'; then
-            echo "::notice::Marshaller.Bytes 在 $NEW 中存在，可以安全 bump"
-            exit 0
-          fi
-          {
-            echo "## ⛔ 未 bump：dae API 已变"
-            echo ""
-            echo "\`Marshaller.Bytes()\`（\`config/marshal.go\`）在 dae \`$NEW\` 中不存在或已重构。"
-            echo "wing main 依赖该方法，自动 bump 会导致构建失败。"
-            echo ""
-            echo "需要人工介入，按 README §5 手动处理。"
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "::error title=dae API 变更，放弃自动 bump::Marshaller.Bytes 已消失，需人工确认"
-          exit 1
-
-      # 与上游做法的差异 ②：pin 存仓库根目录的普通文件 dae-core.pin，不写进本 workflow。
-      # 否则自动 bump 会改动 .github/workflows/ 下的文件，而 GITHUB_TOKEN 没有
-      # workflows 权限，服务端会直接拒绝这次 push。
-      - name: Bump dae-core pin
-        if: needs.check.outputs.need_dae == 'true'
-        run: |
-          set -euo pipefail
-          NEW="${{ needs.check.outputs.dae_new }}"
-          # 先校验 sha 合法性：坏值（空串/undefined）也会让"回读"假通过
-          [[ "$NEW" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::dae_new 不是合法 sha: '$NEW'"; exit 1; }
-          printf '%s\n' "$NEW" > dae-core.pin
-          # 回读校验，不一致就停——绝不推一个写坏的 pin
-          [ "$(cat dae-core.pin)" = "$NEW" ] \
-            || { echo "::error::dae-core.pin 回读不一致"; exit 1; }
-          echo "dae-core.pin -> $NEW"
-
-      # 与上游做法的差异 ③：submodule 指针用 git 命令改，不用 sed。
+      # 与上游做法的差异 ②：submodule 指针用 git 命令改，不用 sed。
       # 指针是 git 对象不是文本，改错会得到一个损坏的 submodule。
       - name: Bump dae-wing submodule
         if: needs.check.outputs.need_wing == 'true'
@@ -284,18 +239,13 @@ jobs:
           git config user.name szwjp
           git config user.email szwjp@users.noreply.github.com
 
-          # 只暂存本次真正会改的两处。不要 git add -A：checkout/merge 后工作区的
-          # submodule 可能停在旧 SHA，git add -A 会把旧指针写回 index。
-          git add dae-core.pin wing
+          # 只暂存 wing 指针。dae-core.pin 不在这里改——它由 build-custom 在校验通过后提交。
+          # 不要 git add -A：checkout/merge 后工作区的 submodule 可能停在旧 SHA。
+          git add wing
 
-          MSG="bump: 自动同步上游"
-          if [ "${{ needs.check.outputs.need_dae }}" = true ]; then
-            MSG="${MSG}"$'\n'"- dae-core -> ${{ needs.check.outputs.dae_new }}（落后 ${{ needs.check.outputs.dae_commits }} 个 commit）"
-          fi
-          if [ "${{ needs.check.outputs.need_wing }}" = true ]; then
-            MSG="${MSG}"$'\n'"- dae-wing -> ${{ needs.check.outputs.wing_new }}（落后 ${{ needs.check.outputs.wing_commits }} 个 commit）"
-          fi
-          MSG="${MSG}"$'\n\n'"最终把关: build-custom.yml 的断言 + 编译（本次推送后触发）"
+          MSG="bump: 自动同步 dae-wing"
+          MSG="${MSG}"$'\n'"- dae-wing -> ${{ needs.check.outputs.wing_new }}（落后 ${{ needs.check.outputs.wing_commits }} 个 commit）"
+          MSG="${MSG}"$'\n\n'"最终把关: build-custom.yml 的编译 + 发布"
 
           git commit -q -m "$MSG"
           git push origin HEAD:main
@@ -303,8 +253,12 @@ jobs:
 
           # GITHUB_TOKEN 的 push 不会触发下游 workflow，必须显式触发；
           # 用 PAT 推送时 push 事件自己会触发，避免重复构建。
+          # 若 dae-core 也在本次要更新，则不在这里触发：由 advance-dae-core 统一带候选 sha
+          # dispatch 一次，避免同一轮跑两次构建（并发但串行，白烧 3 分钟）。
           if [ "$USING_PAT" = "true" ]; then
             echo "::notice::使用 SYNC_TOKEN 推送，push 事件会自动触发 build-custom.yml"
+          elif [ "${{ needs.check.outputs.need_dae }}" = "true" ]; then
+            echo "::notice::dae-core 有更新，构建由 advance-dae-core 统一触发"
           else
             gh workflow run build-custom.yml --repo "$GITHUB_REPOSITORY" --ref main
             echo "已显式触发 build-custom.yml"
@@ -315,7 +269,13 @@ jobs:
   # needs: bump 是为了串行化：两个 job 都会 push main，并发时后推者必然 non-fast-forward 失败。
   sync-daed:
     needs: [check, bump]
-    if: always() && needs.check.outputs.need_daed == 'true'
+    # bump 失败时不要再 merge 上游：否则 main 上会留下一个没经过构建的提交。
+    # !cancelled() 必须显式写：if 里没有状态函数时 GitHub 会默认 AND 上 success()，
+    # 而 bump 常态是 skipped（上游归档），那样本 job 会永远 skip。
+    if: >-
+      !cancelled() &&
+      (needs.bump.result == 'success' || needs.bump.result == 'skipped') &&
+      needs.check.outputs.need_daed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -413,18 +373,94 @@ jobs:
           git push origin HEAD:main
           echo "已推送到 main"
 
-          # 同 bump：GITHUB_TOKEN 推送不会触发下游 workflow，需显式触发
+          # 同 bump：GITHUB_TOKEN 推送不会触发下游 workflow，需显式触发。
+          # 若 dae-core 也在本次要更新，则由 advance-dae-core 统一 dispatch（带候选 sha），避免重复构建。
           if [ "$USING_PAT" = "true" ]; then
             echo "::notice::使用 SYNC_TOKEN 推送，push 事件会自动触发 build-custom.yml"
+          elif [ "${{ needs.check.outputs.need_dae }}" = "true" ]; then
+            echo "::notice::dae-core 有更新，构建由 advance-dae-core 统一触发"
           else
             gh workflow run build-custom.yml --repo "$GITHUB_REPOSITORY" --ref main
             echo "已显式触发 build-custom.yml"
           fi
 
-  # 失败可见性：上面三个 job 任意一个红，就确保有一个 open issue 记录这些失败。
+  # dae-core 层：不再直接改 pin，而是把候选 sha 交给 build-custom。
+  # build-custom 编译通过并发出 release 后，由它的 pin-dae-core job 提交 dae-core.pin。
+  # 这样 pin 只指向「真实构建通过 + 已发布」的 sha，失败时 pin 不动、下一轮自动重试。
+  advance-dae-core:
+    needs: [check, bump, sync-daed]
+    # bump/sync-daed 被 skip 是正常情况；若它们失败（wing 符号缺失 / merge 冲突），
+    # 就不能再推进 dae-core——等人工处理，避免两个变量同时动。
+    # !cancelled() 必须显式写：否则默认的 success() 会因依赖 job 被 skip 而为 false，
+    # 本 job 永远不执行（dae-core 层静默停摆）。
+    if: >-
+      !cancelled() &&
+      needs.check.outputs.need_dae == 'true' &&
+      (needs.bump.result == 'success' || needs.bump.result == 'skipped') &&
+      (needs.sync-daed.result == 'success' || needs.sync-daed.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Safety check - wing 依赖的 dae API 在候选 sha 中存在
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NEW="${{ needs.check.outputs.dae_new }}"
+          [[ "$NEW" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::dae_new 不是合法 sha: '$NEW'"; exit 1; }
+
+          # 先区分「读不到」和「读到了但符号不在」：404/网络/限流不能当成 API 变更。
+          # 这只是快速失败提示；真正的门禁是 build-custom 的完整编译。
+          MISSING=""; UNREADABLE=""
+          check_symbol() {
+            if ! gh api "repos/daeuniverse/dae/contents/$1?ref=$NEW" --jq '.content' > /tmp/sym.b64; then
+              UNREADABLE="${UNREADABLE:+$UNREADABLE }$3($1)"; return 0
+            fi
+            base64 -d /tmp/sym.b64 | grep -qE "$2" || MISSING="${MISSING:+$MISSING }$3($1)"
+          }
+          check_symbol config/marshal.go     'func \(m \*Marshaller\) Bytes\(\)' 'Marshaller.Bytes'
+          check_symbol control/tcp.go        'type RouteDialParam struct'          'control.RouteDialParam'
+          check_symbol common/consts/ebpf.go 'OutboundControlPlaneRouting'         'consts.OutboundControlPlaneRouting'
+          check_symbol config/desc.go        'SectionDescription'                  'config.SectionDescription'
+
+          if [ -n "$UNREADABLE" ]; then
+            echo "::error title=读取上游失败::这些文件读不到（404/网络/限流），无法判断，本次不推进 dae-core:$UNREADABLE"
+            exit 1
+          fi
+          if [ -n "$MISSING" ]; then
+            {
+              echo "## ⛔ 未推进 dae-core：候选 sha 缺少 wing 依赖的 API"
+              echo ""
+              echo "- 候选 sha: \`$NEW\`"
+              echo "- 缺失符号: \`$MISSING\`"
+              echo ""
+              echo "wing 当前指针依赖这些符号，直接构建会失败。需要人工确认如何处理"
+              echo "（等上游恢复，或同时升级 wing），按 README §5 处理。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=dae API 变更，放弃自动推进::$MISSING"
+            exit 1
+          fi
+          echo "::notice::4 个 dae 符号在 $NEW 中均存在，交给 build-custom 编译验证"
+
+      - name: Dispatch build with candidate dae-core
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NEW="${{ needs.check.outputs.dae_new }}"
+          gh workflow run build-custom.yml \
+            --repo "$GITHUB_REPOSITORY" --ref main \
+            -f dae_core="$NEW"
+          echo "已 dispatch build-custom.yml（dae_core=$NEW）"
+          echo "构建成功后由 build-custom 的 pin-dae-core job 推进 dae-core.pin"
+
+  # 失败可见性：上面四个 job 任意一个红，就确保有一个 open issue 记录这些失败。
   # 已有同标题的 open issue 时只追加评论，避免每天刷屏。
   notify:
-    needs: [check, bump, sync-daed]
+    needs: [check, bump, sync-daed, advance-dae-core]
     if: failure()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -440,6 +476,15 @@ jobs:
           EXIST="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
                     --json number,title --jq ".[] | select(.title == \"$TITLE\") | .number" 2>/dev/null | head -1 || true)"
           if [ -n "$EXIST" ]; then
+            # 去重：持续失败时每个调度周期都会走到这里，12 小时内不重复刷评论。
+            UPDATED="$(gh issue view "$EXIST" --repo "$GITHUB_REPOSITORY" --json updatedAt --jq '.updatedAt' 2>/dev/null || true)"
+            if [ -n "$UPDATED" ]; then
+              AGE=$(( $(date +%s) - $(date -d "$UPDATED" +%s) ))
+              if [ "$AGE" -lt 43200 ]; then
+                echo "::notice::issue #$EXIST 12 小时内已更新过，本轮不重复评论"
+                exit 0
+              fi
+            fi
             gh issue comment "$EXIST" --repo "$GITHUB_REPOSITORY" --body "$BODY"
             echo "已在已有 issue #$EXIST 追加失败记录"
           else

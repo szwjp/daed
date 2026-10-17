@@ -1,8 +1,20 @@
 name: Build daed bundle (linux/amd64)
 
-# 用途：用官方 daed 源码 + bump 后的 wing 子模块，产出纯上游的 x86_64 daed 二进制。
-# 官方 release-please.yml 已删除：fork 里的 Actions 无权创建 PR，该流程必然失败，
-# 且本仓库的产物走 Actions artifact 而非 release，故不走它。
+# 用途：用官方 daed 源码 + 按 dae-core.pin 锁定的 dae 内核，产出 x86_64 单二进制并发布 Release。
+#
+# 无人值守链路（2026-10-17 起）：
+#   check-upstream.yml（每 6 小时）发现 dae 有新提交
+#     → dispatch 本 workflow 并传入 dae_core=<新 sha>
+#     → 本 workflow 先完整编译验证
+#     → 成功：发不可变 Release，再由 pin-dae-core job 把 dae-core.pin 推进到该 sha
+#     → 失败：不发 release、不推进 pin，notify job 开 issue，下一轮调度自动重试
+#   这样「pin 永远指向一个真实构建通过的内核」，不会出现 pin 先推进、构建才失败的死状态。
+#
+# Release tag 不可变：v<上游版本>-nightly-<YYYYMMDD>-<fork sha7>-<dae-core sha7>
+#   - tag 同时编码 fork commit 与 dae-core 候选：两者任一变化都产生新 tag，互不覆盖
+#   - 同一组构建输入重跑幂等（tag 已存在时回读校验 notes/资产一致后跳过）
+#   - 下游写死的 PKG_HASH 因此永远有效，不会指向被删/被覆盖的资产
+#
 # 与官方构建相比的差异：
 #   1) 显式安装 clang/llvm（官方 workflow 依赖 runner 预装，ebpf 那步容易挂）
 #   2) 前端从源码构建（含自定义 UI：Header 显示内核版本），不再用官方 web.zip
@@ -12,17 +24,32 @@ name: Build daed bundle (linux/amd64)
 
 on:
   workflow_dispatch:
+    inputs:
+      dae_core:
+        description: '要构建的 dae-core sha（40 位 hex）。留空则用 dae-core.pin 当前值'
+        required: false
+        type: string
   push:
     branches: [main]
+
+# 同一时刻只跑一条构建链：避免同一天两个 run 同时发 release / 同时改 pin。
+concurrency:
+  group: build-custom
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       GOOS: linux
       GOARCH: amd64
       GOAMD64: v1
       CGO_ENABLED: "0"
+    outputs:
+      dae_core: ${{ steps.pin.outputs.sha }}
+      pin_current: ${{ steps.pin.outputs.current }}
+      wing_sha: ${{ steps.revs.outputs.wing }}
     steps:
       - name: Checkout with submodules
         uses: actions/checkout@v7
@@ -30,78 +57,82 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Pin dae-core to main (wing main requires Marshaller.Bytes, restored in #1117)
+      # 发布前必须确认 fork 定制内容仍在（merge/重建可能覆盖）。放在构建最前：
+      # 失败快、不浪费 3 分钟编译；而 build 失败会连带 release/pin 一起 skip，
+      # 所以这一道确实在发布路径上（之前只跑在 check/bump 里，实际拦不住 Release）。
+      - name: Verify fork customizations intact
+        run: bash hack/check-fork-customizations.sh
+
+      - name: Resolve dae-core target
         id: pin
         run: |
           set -euo pipefail
-          DAECORE="$(sed -nE 's/^([0-9a-f]{40})[[:space:]]*$/\1/p' dae-core.pin | head -1)"
-          [ -n "$DAECORE" ] || { echo "::error::dae-core.pin 里没有合法的 40 位 sha"; exit 1; }
-          echo "dae-core.pin: $DAECORE"
-          git -C wing/dae-core fetch --depth 1 origin "$DAECORE"
-          git -C wing/dae-core checkout -q "$DAECORE"
-          git -C wing/dae-core submodule update --init --recursive
-          [ "$(git -C wing/dae-core rev-parse HEAD)" = "$DAECORE" ] \
-            || { echo "::error::dae-core 指针回读不一致"; exit 1; }
-          echo "sha=$DAECORE" >> "$GITHUB_OUTPUT"
+          CURRENT="$(sed -nE 's/^([0-9a-f]{40})[[:space:]]*$/\1/p' dae-core.pin | head -1)"
+          [ -n "$CURRENT" ] || { echo "::error::dae-core.pin 里没有合法的 40 位 sha"; exit 1; }
 
-      # 断言：pin 的 dae-core 是否仍等于 dae main 的 tip。
-      # 这道断言不校验编译产物，只校验「你构建的内核是不是上游最新」——
-      # 上一版流程里 pin 落后时 CI 依然全绿，产物能跑、版本号照常，
-      # 只有内核代码是旧的。这是唯一能在发布前发现 pin 腐烂的地方。
-      - name: Assert dae-core pin matches dae main
+          # push 触发的构建没有 input，按 pin 构建；check-upstream 会显式传候选 sha。
+          CANDIDATE="${{ github.event.inputs.dae_core }}"
+          if [ -z "$CANDIDATE" ]; then
+            CANDIDATE="$CURRENT"
+          fi
+          [[ "$CANDIDATE" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::dae_core 不是合法 sha: '$CANDIDATE'"; exit 1; }
+
+          echo "dae-core.pin（当前）: $CURRENT"
+          echo "本次构建目标       : $CANDIDATE"
+          echo "sha=$CANDIDATE" >> "$GITHUB_OUTPUT"
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout dae-core at target
         run: |
-          PINNED="${{ steps.pin.outputs.sha }}"
+          set -euo pipefail
+          CANDIDATE="${{ steps.pin.outputs.sha }}"
+          git -C wing/dae-core fetch --depth 1 origin "$CANDIDATE"
+          git -C wing/dae-core checkout -q "$CANDIDATE"
+          git -C wing/dae-core submodule update --init --recursive
+          [ "$(git -C wing/dae-core rev-parse HEAD)" = "$CANDIDATE" ] \
+            || { echo "::error::dae-core 指针回读不一致"; exit 1; }
+
+      # 断言：本次要构建的 dae-core 必须就是 dae main 的 tip。
+      # 这道断言不校验编译产物，只校验「你构建的内核是不是上游最新」——
+      # pin 落后时 CI 依然全绿、产物能跑、版本号照常，只有内核代码是旧的。
+      # 现在 pin 由构建成功后推进，正常情况下 candidate == tip；不等说明上游又动了，等下次调度重试。
+      - name: Assert dae-core target is dae main tip
+        run: |
+          set -euo pipefail
+          CANDIDATE="${{ steps.pin.outputs.sha }}"
           cd wing/dae-core
 
-          # 取 main 的 tip。浅克隆下用 FETCH_HEAD，避免 --depth 1 时
-          # main tip 与 pin 不在同一历史导致 fetch 失败。
           git fetch --depth 1 origin main
           UPSTREAM="$(git rev-parse FETCH_HEAD)"
-
-          echo "pinned    : $PINNED"
+          echo "target    : $CANDIDATE"
           echo "dae main  : $UPSTREAM"
 
-          if [ "$PINNED" = "$UPSTREAM" ]; then
-            echo "::notice title=dae-core pin::in sync with dae main"
+          if [ "$CANDIDATE" = "$UPSTREAM" ]; then
+            echo "::notice title=dae-core target::is dae main tip"
             exit 0
           fi
 
-          # 落后多少：需要完整历史才能算，超出浅克隆深度就退化为 "unknown"。
-          git fetch --unshallow origin 2>/dev/null || git fetch --depth 200 origin main
-          if git merge-base --is-ancestor "$PINNED" "$UPSTREAM" 2>/dev/null; then
-            BEHIND="$(git rev-list --count "$PINNED".."$UPSTREAM")"
-            SUBJECT="$(git log -1 --format=%s "$UPSTREAM")"
-            {
-              echo "## dae-core pin 已落后 dae main" >> "$GITHUB_STEP_SUMMARY"
-              echo "" >> "$GITHUB_STEP_SUMMARY"
-              echo "- pinned: \`$PINNED\`" >> "$GITHUB_STEP_SUMMARY"
-              echo "- main  : \`$UPSTREAM\`" >> "$GITHUB_STEP_SUMMARY"
-              echo "- 落后  : **$BEHIND** 个 commit" >> "$GITHUB_STEP_SUMMARY"
-              echo "- main  : $SUBJECT" >> "$GITHUB_STEP_SUMMARY"
-              echo "" >> "$GITHUB_STEP_SUMMARY"
-              echo "更新 pin：改仓库根目录的 dae-core.pin（一行 40 位 sha），" >> "$GITHUB_STEP_SUMMARY"
-              echo "确认 wing main 需要的 \`Marshaller.Bytes\` 仍在后重新构建。" >> "$GITHUB_STEP_SUMMARY"
-            } || true
-            echo "::warning title=dae-core pin stale::落后 $BEHIND 个 commit，产物仍可构建但内核不是 dae 最新"
-            exit 1
-          fi
-
-          # pin 不在上游 main 的祖先链上：可能被 revert、force-push 或写错。
           {
-            echo "## dae-core pin 与 dae main 无祖先关系" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "\`$PINNED\` 不是 \`$UPSTREAM\` 的祖先。pin 可能已被 revert 或 force-push 掉，" >> "$GITHUB_STEP_SUMMARY"
-            echo "必须人工确认后再使用这个产物。" >> "$GITHUB_STEP_SUMMARY"
-          } || true
-          echo "::error title=dae-core pin diverged::pin 不是 dae main 的祖先，需人工确认"
+            echo "## dae-core 目标不是 dae main tip"
+            echo ""
+            echo "- target  : \`$CANDIDATE\`"
+            echo "- dae main: \`$UPSTREAM\`"
+            echo ""
+            echo "上游在本次调度后又前进了。本次不构建、不发布，等下一轮调度自动重试。"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning title=dae-core not at main tip::target=$CANDIDATE main=$UPSTREAM，跳过本次构建"
           exit 1
 
       - name: Show pinned revisions
+        id: revs
         run: |
+          set -euo pipefail
           echo "daed     : $(git rev-parse HEAD)"
           echo "wing     : $(git -C wing rev-parse HEAD)"
           echo "dae-core : $(git -C wing/dae-core rev-parse HEAD)"
           echo "outbound : $(grep -E 'olicesx/outbound' wing/go.mod | head -1)"
+          echo "wing=$(git -C wing rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-go@v6
         with:
@@ -141,21 +172,35 @@ jobs:
 
       - name: Bundle
         working-directory: wing
+        env:
+          DAE_CORE_SHA: ${{ steps.pin.outputs.sha }}
         run: |
           mkdir -p ../bundled
+          # 版本串带上 dae-core sha 前 7 位，产物一眼能对上源码。
           make OUTPUT=../bundled/daed-linux-x86_64 APPNAME=daed \
-               WEB_DIST=../apps/web/dist VERSION="v2.1.1-wingmain-$(date -u +%Y%m%d)" bundle
+               WEB_DIST=../apps/web/dist \
+               VERSION="v2.1.1-wingmain-$(date -u +%Y%m%d)-${DAE_CORE_SHA:0:7}" bundle
 
       - name: Collect bundle
         run: |
+          set -euo pipefail
           cd bundled
           cp ../install/daed.service ../install/daed.desktop .
           cp -r ../install/icons .
-          curl -sSL -o geoip.dat  https://github.com/v2rayA/dist-v2ray-rules-dat/raw/master/geoip.dat
-          curl -sSL -o geosite.dat https://github.com/v2rayA/dist-v2ray-rules-dat/raw/master/geosite.dat
+          # -f：HTTP 404/5xx 必须失败，不能把错误页当 geo 数据打进 release。
+          curl -fsSL -o geoip.dat  https://github.com/v2rayA/dist-v2ray-rules-dat/raw/master/geoip.dat
+          curl -fsSL -o geosite.dat https://github.com/v2rayA/dist-v2ray-rules-dat/raw/master/geosite.dat
+          for f in geoip.dat geosite.dat; do
+            [ -s "$f" ] || { echo "::error::$f 为空"; exit 1; }
+            [ "$(stat -c%s "$f")" -gt 5000000 ] || { echo "::error::$f 体积异常（$(stat -c%s "$f") B）"; exit 1; }
+          done
+          BIN_SIZE="$(stat -c%s daed-linux-x86_64)"
+          [ "$BIN_SIZE" -gt 40000000 ] || { echo "::error::二进制体积异常（$BIN_SIZE B）"; exit 1; }
           file daed-linux-x86_64
-          ./daed-linux-x86_64 --version || true
-          strings daed-linux-x86_64 | grep -cE "disable_thp|auto_sniff_punt|bpf_conn_state_map_size" || true
+          echo "binary bytes: $BIN_SIZE"
+          # --version 失败必须红：产物连版本都报不出来，就不该发。
+          ./daed-linux-x86_64 --version
+          strings daed-linux-x86_64 | grep -cE "disable_thp|auto_sniff_punt|bpf_conn_state_map_size"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -163,25 +208,22 @@ jobs:
           path: bundled/*
 
   # 产物分发：把 bundle 打成 tar.gz 上传 GitHub Release，OpenWrt 包从 release 拉。
-  # 触发：push 触发且 build 跑通；commit message 含 [skip release] 时跳过。
-  # 重复发布同一日 release 时先删旧的；tag 形如 v2.1.1-nightly-20261016。
-  #
-  # 防御性 if：push 的 before/after 字段在 re-run 场景可能为 null，
-  # 这里只依赖 event_name + commit message（注意 GH 表达式没有 toLower，skip token 写全小写）。
+  # tag 由内容（日期 + 本次 commit）决定，天然不可变、幂等。
   release:
     needs: build
     if: >-
       success() &&
+      github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
-      (github.event.head_commit.message == null ||
-       !contains(github.event.head_commit.message, '[skip release]'))
+      (github.event_name != 'push' ||
+       github.event.head_commit.message == null ||
+       !startsWith(github.event.head_commit.message, '[skip release]'))
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
-      # release job 拉 pin 文件的最小 checkout（sparse 模式，只取 dae-core.pin）。
-      # 不取整个仓库是为了避免污染 release job 工作区。
+      # release job 只需要 pin 文件（写 notes 用），sparse 取一个文件即可。
       - uses: actions/checkout@v6
         with:
           fetch-depth: 1
@@ -194,61 +236,61 @@ jobs:
 
       - name: Inspect bundle
         run: |
+          set -euo pipefail
+          # upload/download-artifact 不保留文件权限，下载后一律 644；
+          # 不 chmod 的话下面的可执行断言必失败，release job 会红。
+          chmod 0755 bundled/daed-linux-x86_64
           ls -la bundled/
           file bundled/daed-linux-x86_64
-
-      - name: Pin dae-core in release notes
-        run: |
-          PIN="$(cat dae-core.pin)"
-          echo "DAECORE_PIN=$PIN" >> "$GITHUB_ENV"
+          test -x bundled/daed-linux-x86_64 || { echo "::error::二进制不可执行"; exit 1; }
 
       - name: Pack tarball
         run: |
+          set -euo pipefail
+          # 再 chmod 一次：让 tar 内也带可执行位（下游虽然会自己 chmod，但产物保持一致）。
+          chmod 0755 bundled/daed-linux-x86_64
           tar -czf daed-linux-x86_64.tar.gz \
             -C bundled daed-linux-x86_64 daed.service daed.desktop icons \
             geoip.dat geosite.dat
+          sha256sum daed-linux-x86_64.tar.gz | awk '{print $1}' > daed-linux-x86_64.tar.gz.sha256
+          tar -tvzf daed-linux-x86_64.tar.gz | head -3
           ls -la daed-linux-x86_64.tar.gz
-          # 上传到 runner 的固定路径，方便 create release 时 attach
-          echo "ASSET_PATH=$(pwd -W 2>/dev/null || pwd)/daed-linux-x86_64.tar.gz" >> "$GITHUB_ENV"
+          cat daed-linux-x86_64.tar.gz.sha256
 
       - name: Compute tag
         id: meta
         env:
-          GH_TOKEN: ${{ github.token }}
+          DAECORE: ${{ needs.build.outputs.dae_core }}
         run: |
           set -euo pipefail
           DATE="$(date -u +%Y%m%d)"
-          TAG="v2.1.1-nightly-${DATE}"
-
-          # 同一日重发：先删旧 tag。失败不致命（首次跑就没有）。
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "::notice::release $TAG 已存在，先删除再重发"
-            gh release delete "$TAG" --yes
-          fi
+          SHORT="${GITHUB_SHA:0:7}"
+          [[ "$DAECORE" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::构建目标 sha 非法: '$DAECORE'"; exit 1; }
+          CAND="${DAECORE:0:7}"
+          # tag 必须同时编码「fork commit」和「dae-core 候选」：
+          # 两者任一变化都会改变二进制。只编码 fork commit 时，同一天对同一 commit
+          # 用不同 dae-core 候选构建会撞 tag，导致「release 内容是旧 pin、仓库 pin 却是新值」。
+          TAG="v2.1.1-nightly-${DATE}-${SHORT}-${CAND}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
-          # 比较上次 build 以来多了多少 commit：before/after 字段在 re-run 时可能为 null，
-          # 此时显示 "?"，不阻塞发布。
-          BEFORE="${{ github.event.before }}"
-          AFTER="${{ github.sha }}"
-          if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
-            COMPARED="$(gh api "repos/szwjp/daed/compare/${BEFORE}...${AFTER}" --jq '.commits | length' 2>/dev/null || echo '?')"
-          else
-            COMPARED="?"
-          fi
-          echo "compared=$COMPARED" >> "$GITHUB_OUTPUT"
+          echo "release tag: $TAG"
 
       - name: Write release notes file
         env:
-          DAECORE_PIN: ${{ env.DAECORE_PIN }}
+          WING_SHA: ${{ needs.build.outputs.wing_sha }}
+          CANDIDATE: ${{ needs.build.outputs.dae_core }}
         run: |
+          set -euo pipefail
+          # 注意：这里必须用「本次构建目标」，不能用 dae-core.pin——
+          # pin 由本 workflow 成功后才推进，此刻文件里还是旧值。
+          PIN="$CANDIDATE"
+          [[ "$PIN" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::构建目标 sha 非法: '$PIN'"; exit 1; }
           cat > release-notes.md <<EOF
           # szwjp/daed nightly $(date -u +%Y.%m.%d)
 
           - commit: \`${{ github.sha }}\`
-          - dae-core pin: \`${DAECORE_PIN}\`
-          - wing: pinned in submodule
-          - this run: ${{ steps.meta.outputs.compared }} commit(s) since previous build
+          - dae-core pin: \`${PIN}\`
+          - wing: \`${WING_SHA}\`
+          - daed bundle: \`v2.1.1-wingmain-$(date -u +%Y%m%d)-${PIN:0:7}\`
 
           ## What this is
           daed (web UI) bundled with dae + dae-wing, built from szwjp/daed@main.
@@ -261,12 +303,132 @@ jobs:
           EOF
           cat release-notes.md
 
-      - name: Create release
+      - name: Create release (immutable; skip if already exists)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DAECORE: ${{ needs.build.outputs.dae_core }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # 幂等分支不能盲信 tag：必须回读「release 内容是否就是本次构建」。
+            # 否则上次 create 成功但资产上传中断 / notes 写入异常时，会把不完整
+            # 的 release 当成已完成，随后 pin 被推进到未真正发布的 sha。
+            BODY="$(gh release view "$TAG" --json body --jq '.body')"
+            ASSETS="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+            printf '%s\n' "$BODY" | grep -q "dae-core pin:.*$DAECORE" \
+              || { echo "::error::release $TAG 的 notes 里 dae-core pin 不是本次候选 $DAECORE，拒绝推进 pin"; exit 1; }
+            for a in daed-linux-x86_64.tar.gz daed-linux-x86_64.tar.gz.sha256; do
+              printf '%s\n' "$ASSETS" | grep -qx "$a" \
+                || { echo "::error::release $TAG 缺少资产 $a，拒绝推进 pin"; exit 1; }
+            done
+            echo "::notice::release $TAG 已存在且内容与本次构建一致，跳过发布"
+            exit 0
+          fi
+          # 孤儿 tag 防御：tag 已存在但没有 release 时，确认它指向本次 commit。
+          # 否则 create 会复用旧 tag，造成「tag 与产物不一致」的静默错误。
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            REF_SHA="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.sha')"
+            if [ "$REF_SHA" != "$GITHUB_SHA" ]; then
+              echo "::error::孤儿 tag $TAG 指向 $REF_SHA，与本次 commit $GITHUB_SHA 不一致，需人工处理"
+              exit 1
+            fi
+            echo "::notice::孤儿 tag $TAG 指向本次 commit，复用它创建 release"
+          fi
+          gh release create "$TAG" \
+            --title "szwjp/daed nightly $(date -u +%Y.%m.%d)" \
+            --notes-file release-notes.md \
+            --target "$GITHUB_SHA" \
+            daed-linux-x86_64.tar.gz \
+            daed-linux-x86_64.tar.gz.sha256
+
+  # pin 只在这里推进：release 真的发成功了才改 dae-core.pin。
+  # 用 GITHUB_TOKEN push（普通文件，无需 workflows 权限），push 事件不会触发新 run，天然防环。
+  pin-dae-core:
+    needs: [build, release]
+    # 显式要求 release 成功 + 在 main 上：不要把「没有 release 也推进 pin」的口子留给隐式 skip 传播。
+    if: >-
+      success() &&
+      github.ref == 'refs/heads/main' &&
+      needs.release.result == 'success' &&
+      needs.build.outputs.dae_core != needs.build.outputs.pin_current
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          sparse-checkout: dae-core.pin
+
+      - name: Advance dae-core.pin to the built revision
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ steps.meta.outputs.tag }}" \
-            --title "szwjp/daed nightly $(date -u +%Y.%m.%d)" \
-            --notes-file release-notes.md \
-            --target "${{ github.sha }}" \
-            daed-linux-x86_64.tar.gz
+          set -euo pipefail
+          NEW="${{ needs.build.outputs.dae_core }}"
+          [[ "$NEW" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::非法 sha: '$NEW'"; exit 1; }
+          CUR="$(sed -nE 's/^([0-9a-f]{40})[[:space:]]*$/\1/p' dae-core.pin | head -1)"
+          if [ "$CUR" = "$NEW" ]; then
+            echo "::notice::dae-core.pin 已是 $NEW，无需推进"
+            exit 0
+          fi
+
+          git config user.name szwjp
+          git config user.email szwjp@users.noreply.github.com
+          printf '%s\n' "$NEW" > dae-core.pin
+          [ "$(cat dae-core.pin)" = "$NEW" ] || { echo "::error::dae-core.pin 回读不一致"; exit 1; }
+          git add dae-core.pin
+          git commit -q -m "ci: 构建成功后推进 dae-core pin -> ${NEW:0:8}" \
+            -m "由 build-custom.yml 在 release 成功后自动提交（pin 只在真实构建通过后前进）。"
+
+          # main 可能在构建期间被推进：rebase 后重试，最多 3 次。
+          for i in 1 2 3; do
+            git fetch -q origin main
+            git rebase -q origin/main || { git rebase --abort 2>/dev/null || true; echo "::error::rebase 失败"; exit 1; }
+            if git push -q origin HEAD:main; then
+              echo "已推送 dae-core.pin -> $NEW"
+              exit 0
+            fi
+            echo "push 失败（第 $i 次），等待后重试"
+            sleep 5
+          done
+          echo "::error::连续 3 次推送失败"
+          exit 1
+
+  # 失败可见性：构建/发布/推进 pin 任一环节红，开 issue 记录 run 链接。
+  notify:
+    needs: [build, release, pin-dae-core]
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Report failure as an issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TITLE="build-custom 构建/发布失败"
+          BODY="$(printf 'daed 构建/发布链路失败，需要人工看一下。\n\n- run: %s/%s/actions/runs/%s\n- 提交: %s\n- 事件: %s\n\n注意：本次没有推进 dae-core.pin（pin 只在校验通过后前进）。若上游 dae 又前进了，下一轮调度会自动重试；连续失败则需要看日志定位编译/API 不兼容。\n' \
+            "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_SHA" "$GITHUB_EVENT_NAME")"
+          EXIST="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 \
+                    --json number,title --jq ".[] | select(.title == \"$TITLE\") | .number" 2>/dev/null | head -1 || true)"
+          if [ -n "$EXIST" ]; then
+            # 去重：持续失败时每个调度周期都会走到这里，12 小时内不重复刷评论。
+            UPDATED="$(gh issue view "$EXIST" --repo "$GITHUB_REPOSITORY" --json updatedAt --jq '.updatedAt' 2>/dev/null || true)"
+            if [ -n "$UPDATED" ]; then
+              AGE=$(( $(date +%s) - $(date -d "$UPDATED" +%s) ))
+              if [ "$AGE" -lt 43200 ]; then
+                echo "::notice::issue #$EXIST 12 小时内已更新过，本轮不重复评论"
+                exit 0
+              fi
+            fi
+            gh issue comment "$EXIST" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+            echo "已在已有 issue #$EXIST 追加失败记录"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY"
+            echo "已创建失败 issue"
+          fi

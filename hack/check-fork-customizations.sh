@@ -25,7 +25,7 @@ check apps/web/src/i18n/locales/zh-Hans.json 'coreVersion'
 check apps/web/src/i18n/locales/en.json      'coreVersion'
 check apps/web/src/contexts/index.tsx        'DEFAULT_ENDPOINT_URL'
 check apps/web/src/pages/Setup.tsx           'endpoint unreachable'
-check .github/workflows/build-custom.yml     'Assert dae-core pin matches dae main'
+check .github/workflows/build-custom.yml     'Assert dae-core target is dae main tip'
 
 # release-please.yml 必须保持删除：fork 里的 Actions 无权创建 PR
 TOTAL=$((TOTAL + 1))

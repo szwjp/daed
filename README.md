@@ -1,8 +1,12 @@
 # szwjp/daed
 
 > **这是 [daeuniverse/daed](https://github.com/daeuniverse/daed) 的自维护 fork。**
-> 目标：自动跟随官方 dae / dae-wing / daed 三层上游，同时保留本 fork 的本地定制。
-> 不是什么：不是发布源，不提供 release，不替代上游。
+> 目标：自动跟随官方 dae / dae-wing / daed 三层上游，编译出最新可用二进制并发 Release。
+> 产物是这个生态里 [szwjp/luci-app-daed](https://github.com/szwjp/luci-app-daed) 的包源。
+>
+> **2026-10-17 上游现状**：`daeuniverse/daed` 与 `daeuniverse/dae-wing` **均已 archived**
+> （最后提交分别为 2026-09-24 / 09-23），只有 `daeuniverse/dae` 还在演进。
+> 「跟随上游」实际只剩 dae-core 一层会日常动作；另外两层保留检测与合并逻辑，但无新提交可同步。
 
 本文件记录**这个 fork 与上游的所有差异，以及为什么这么改**。
 官方 README 见 [daeuniverse/daed](https://github.com/daeuniverse/daed#readme)。
@@ -26,51 +30,74 @@ daed (React 前端)              ← 本 fork main
 
 ## 2. 自动同步机制
 
-`.github/workflows/check-upstream.yml` —— 每天 UTC 00:00（北京 08:00）运行，
-也可手动 `workflow_dispatch`。
+`.github/workflows/check-upstream.yml` —— 每 6 小时运行一次（UTC 00/06/12/18），
+也可手动 `workflow_dispatch`。上游没变化时只做 API 探测，不构建。
 
 | 层 | 更新方式 | 有更新时 |
 |---|---|---|
-| **dae-core** | 改根目录 `dae-core.pin`（一行 40 位 sha） | 自动 bump + 推送 |
-| **dae-wing** | `git -C wing checkout` submodule | 自动 bump + 推送 |
-| **daed** | `git merge upstream/main` | merge 干净才自动推；冲突则停下 |
+| **dae-core** | 候选 sha 交给 `build-custom.yml` 编译验证 | 编译通过并发 Release 后，由 build-custom 提交 `dae-core.pin`；失败则 pin 不动、下一轮重试 |
+| **dae-wing** | `git -C wing checkout` submodule | 自动 bump + 推送（上游已 archived，实际不会再变） |
+| **daed** | `git merge upstream/main` | merge 干净才自动推；冲突则停下（上游已 archived，实际不会再变） |
+
+**为什么 pin 不在 check-upstream 里直接改**：先改 pin 再构建，一旦构建失败，仓库就停在
+一个「pin 指向坏内核」的状态，而 CI 只会在构建 job 上红一次，第二天还得人工回滚。
+现在改为 **pin 只在构建通过 + Release 发成功后由 build-custom 的 `pin-dae-core` job 提交**：
+失败不会污染 main，下一轮调度自动重试同一个候选 sha。
 
 **pin 为什么放在 `dae-core.pin` 这种普通文件里**：`GITHUB_TOKEN` 没有 `workflows` 权限，
 自动 bump 一旦改动 `.github/workflows/` 下的文件，push 会被服务端拒绝
 （`refusing to allow a GitHub App to create or update workflow ... without workflows permission`）。
 
 **推送后怎么触发构建**：`GITHUB_TOKEN` 触发的 push 事件**不会**创建新的 workflow run
-（只有 `workflow_dispatch` / `repository_dispatch` 例外），所以推送后由 workflow 自己
-`gh workflow run build-custom.yml` 显式触发。若在仓库里配了 `SYNC_TOKEN`
-（fine-grained PAT 或 GitHub App token，需要 **Contents: r/w + Workflows: r/w**），
-推送就走它，push 事件会自动触发构建，workflow 不再重复 dispatch；同时上游改动
-自己 workflow 文件时也能正常同步（GITHUB_TOKEN 做不到）。
+（只有 `workflow_dispatch` / `repository_dispatch` 例外），所以：
+- dae-core 有更新时，由 `advance-dae-core` job 显式 `gh workflow run build-custom.yml -f dae_core=<sha>`；
+- wing/daed 有更新并推送后，由对应 job 显式 `gh workflow run build-custom.yml`；
+- 若在仓库里配了 `SYNC_TOKEN`（fine-grained PAT 或 GitHub App token，需要 **Contents: r/w + Workflows: r/w**），
+  推送就走它，push 事件会自动触发构建，workflow 不再重复 dispatch。
 
-### 四道关口
+### 2.1 Release 与 tag
+
+build-custom 在 main 上构建成功后自动发 GitHub Release：
+
+| 项 | 规则 |
+|---|---|
+| tag | `v<上游版本>-nightly-<YYYYMMDD>-<fork commit 前 7 位>-<dae-core 前 7 位>`，例 `v2.1.1-nightly-20261017-58fc2f0-a1b2c3d` |
+| 不可变性 | tag 由「日期 + fork commit + dae-core」决定；同输入重跑幂等（回读校验后跳过，不删不重建） |
+| 资产 | `daed-linux-x86_64.tar.gz`（约 34MB）+ `.sha256` |
+| notes | 含本次 commit、`dae-core pin`、wing sha、bundle 版本串（下游从这行抓 pin） |
+
+**为什么 tag 要同时带 fork commit 和 dae-core**：下游 `szwjp/luci-app-daed` 把 tag URL 和
+文件 sha256 一起写进 Makefile。如果 tag 可被「先删后建」覆盖，同一天重发就会让下游写死的
+hash 指向已删除的资产；而只编码 fork commit 时，同一天对同一 commit 用不同 dae-core 候选
+构建会撞 tag，导致 release 内容是旧 pin、仓库 pin 却是新值。现在 tag 由完整构建输入决定，
+重发只会产生新 tag，旧 tag 的资产永远有效。
+
+### 2.2 四道关口
 
 | 时机 | 检查 | 拦住什么 |
 |---|---|---|
-| bump dae-core 前 | 新 pin 的 `Marshaller.Bytes()` 存在 | 上游重构了 wing 依赖的 API |
-| bump wing 后 | 4 个 dae 导出符号存在 | 新版 wing 要的 API 当前 pin 没有 |
-| push 前 / merge 后 | `hack/check-fork-customizations.sh` 指纹（当前 8 项） | merge 覆盖了定制内容 |
-| push 后 | `Assert dae-core pin matches dae main` | pin 与 dae main 不一致 |
+| 推进 dae-core 前 | 候选 sha 的 4 个 dae 导出符号存在（快速失败） | 上游重构了 wing 依赖的 API |
+| 构建时 | `Assert dae-core target is dae main tip` | 构建的不是上游最新（上游又前进了） |
+| 构建/merge 后 | `hack/check-fork-customizations.sh` 指纹（当前 8 项） | merge 覆盖了定制内容 |
+| 构建成功后 | Release + `pin-dae-core` 才推进 pin | pin 指向一个没发布或编译失败的 sha |
 
 失败时（任一 job 红）会自动开一个 issue 记录 run 链接；已有同名 open issue 时只追加评论。
 step summary（run 页面 Summary 标签）里也会写明具体缺什么。
 
 **关于定时触发**：schedule 依赖 GitHub 的定时器——fork 里的 scheduled workflow 需要手动启用，
-且公开仓库 60 天无仓库活动会被自动禁用。发现每天不再自动跑时，去 Actions 页面重新启用即可。
+且公开仓库 60 天无仓库活动会被自动禁用。发现定时不再自动跑时，去 Actions 页面重新启用即可。
+（本 fork 的 build-custom 成功后会提交 dae-core.pin，属于仓库活动，有助于保活。）
 
-### 红灯含义
+### 2.3 红灯含义
 
 | 现象 | 含义 | 处理 |
 |---|---|---|
-| `pin stale` warning | dae 上游有更新，pin 落后 N 个 commit | 按 §5 更新 pin |
-| `pin diverged` error | pin 不是 dae main 的祖先（上游 force-push/revert） | 读上游历史，人工判断 |
-| `API 变更，放弃自动 bump` | wing 依赖的 dae API 消失 | 读上游 commit，评估替代方案 |
+| `dae-core not at main tip` | 调度后上游又前进了，本次跳过 | 等下一轮自动重试，或手动再调度 |
+| `dae API 变更，放弃自动推进` | 候选 sha 缺少 wing 依赖的符号 | 读上游 commit，评估是否同时升级 wing |
 | `wing 依赖缺失，放弃自动 bump` | 当前 pin 缺少新版 wing 需要的符号 | 先升级 pin（§5） |
 | `读取上游失败` | 404/网络/限流导致判断不了（不是 API 变更） | 重跑一次即可 |
 | `merge 有冲突` | 上游改了本 fork 定制过的文件 | 人工解冲突，见 §6 |
+| `build-custom 构建/发布失败` | 编译、geo 下载、Release 失败 | 看 run 日志；pin 未推进，下一轮自动重试 |
 
 **step summary（run 页面 Summary 标签）里会写明具体缺什么。**
 
@@ -115,8 +142,9 @@ merge 上游或 bump 时丢失任何一处，都会被指纹检查拦住。
 
 - 显式安装 clang/llvm（官方依赖 runner 预装，eBPF 那步容易挂）
 - 前端从源码构建（带 3.1 的 UI 改动），不用官方 web.zip
-- dae-core pin 读根目录的 `dae-core.pin`（3 个 workflow 文件之外，便于自动 bump 推送）
-- 加了 pin 一致性断言（§2）
+- dae-core 目标可传入：`workflow_dispatch` 的 `dae_core` 输入，或读 `dae-core.pin`
+- 构建成功后才发不可变 Release，并由 `pin-dae-core` job 推进 `dae-core.pin`（§2）
+- 失败时 notify job 开 issue；pin 不动，下一轮调度重试
 
 ### 3.5 `release-please.yml`（已删除）
 
@@ -180,17 +208,28 @@ ssh root@192.168.1.1 'chmod +x /usr/bin/daed && /etc/init.d/daed start'
 
 自动化已经处理绝大多数情况，只有红灯时才需要手动介入。
 
+**首选：只触发构建，让 build-custom 自己推进 pin**（pin 只在构建成功后变）：
+
 ```bash
 # 1. 取 dae main 最新 sha
-gh api repos/daeuniverse/dae/commits/main --jq '.sha'
+SHA="$(gh api repos/daeuniverse/dae/commits/main --jq '.sha')"
 
-# 2. 确认 wing 依赖的 API 还在（bump 的前提条件）
+# 2. 直接带着它调度构建（构建成功 → 发 Release → 自动提交 dae-core.pin）
+gh workflow run build-custom.yml --repo szwjp/daed --ref main -f dae_core="$SHA"
+
+# 3. 看结果
+gh run list --repo szwjp/daed --workflow build-custom.yml --limit 3
+```
+
+**备选：手动改 pin 再 push**（会走普通 push 构建；构建失败时 pin 会留在坏值上，谨慎）：
+
+```bash
+# 1. 确认 wing 依赖的 API 还在（否则构建必失败）
 gh api repos/daeuniverse/dae/contents/config/marshal.go --jq '.content' \
   | base64 -d | grep -E 'func \(m \*Marshaller\) Bytes\(\)'
 
-# 3. 改根目录的 dae-core.pin（一行 40 位 sha）
-
-# 4. 推送，触发构建
+# 2. 改根目录的 dae-core.pin（一行 40 位 sha）
+# 3. 推送，触发构建
 git commit -am "build(deps): bump dae-core to <短sha>"
 git push
 ```
@@ -245,6 +284,11 @@ cd <repo> && bash hack/check-fork-customizations.sh
 
 # 最近构建
 gh run list --repo szwjp/daed --limit 5
+
+# 最新 Release（tag 应形如 v2.1.1-nightly-YYYYMMDD-<fork7>-<dae7>，且 notes 的 pin 与 dae-core.pin 一致）
+gh release view --repo szwjp/daed --json tagName,publishedAt,assets \
+  --jq '"\(.tagName) \(.publishedAt) \(.assets[].name)"'
+gh release view --repo szwjp/daed --json body --jq '.body' | grep -E 'commit|dae-core pin'
 ```
 
 ---
